@@ -11,7 +11,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 20s
+      start_period: 40s  # INCREASED: Give Zookeeper more time to fully initialize
     volumes:
       - zookeeper-data:/data
 
@@ -39,7 +39,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 30s
+      start_period: 60s  # INCREASED: Give Kafka more time to connect to Zookeeper
 
   db:
     image: mysql
@@ -65,7 +65,6 @@ services:
     build:
       context: storage-mysql
       dockerfile: Dockerfile
-    # FIX FOR ISSUE 1: Storage waits for BOTH db AND kafka to be healthy
     depends_on:
       db:
         condition: service_healthy
@@ -89,7 +88,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
-    # FIX FOR ISSUE 1: Receiver waits for Kafka to be healthy
     depends_on:
       kafka:
         condition: service_healthy
@@ -105,7 +103,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8100:8100"
-    # FIX FOR ISSUE 1: Processing waits for Storage to be healthy
     depends_on:
       storage-service:
         condition: service_healthy
@@ -122,7 +119,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "5005:5005"
-    # FIX FOR ISSUE 1: Analyzer waits for Kafka to be healthy
     depends_on:
       kafka:
         condition: service_healthy
@@ -138,7 +134,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "80:80"
-    # FIX FOR ISSUE 1: Dashboard waits for all services to be ready
     depends_on:
       processing-service:
         condition: service_healthy
