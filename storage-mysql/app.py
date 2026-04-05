@@ -164,13 +164,21 @@ class KafkaConsumerWrapper:
                 time.sleep(5)  # Wait before retrying
 
 
-# Create global consumer wrapper at module startup
-try:
-    consumer_wrapper = KafkaConsumerWrapper(KAFKA_SERVER, KAFKA_TOPIC)
-    logger.info("✅ Global Kafka consumer created successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to create global Kafka consumer: {e}")
-    consumer_wrapper = None
+# Lazy-initialize consumer wrapper (don't create until first use - speeds up startup!)
+consumer_wrapper = None
+
+def get_consumer_wrapper():
+    """Lazily create Kafka consumer on first use"""
+    global consumer_wrapper
+    if consumer_wrapper is None:
+        try:
+            logger.info("[Consumer] Lazily initializing Kafka consumer...")
+            consumer_wrapper = KafkaConsumerWrapper(KAFKA_SERVER, KAFKA_TOPIC)
+            logger.info("✅ Global Kafka consumer created successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to create Kafka consumer: {e}")
+            raise
+    return consumer_wrapper
 
 
 def use_db_session(func):
@@ -308,17 +316,16 @@ def process_messages():
     """
     logger.info(f" Connecting to Kafka at {KAFKA_SERVER}")
     
-    if consumer_wrapper is None:
-        logger.error(" Consumer wrapper not initialized. Exiting.")
-        return
-    
     try:
+        # Lazily get the consumer wrapper (creates it on first access)
+        wrapper = get_consumer_wrapper()
+        
         logger.info(f" Subscribed to topic: {KAFKA_TOPIC}")
         logger.info(" Waiting for messages...")
         
-        # Use the global consumer wrapper to get messages
+        # Use the consumer wrapper to get messages
         # It handles reconnection automatically
-        for msg_data, success in consumer_wrapper.get_messages():
+        for msg_data, success in wrapper.get_messages():
             if not success:
                 continue  # Skip failed messages
             
@@ -369,6 +376,11 @@ app.add_api("storage_openapi.yaml",
 flask_app = app.app
 
 
+def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}, 200
+
+
 @flask_app.route('/')
 def home():
     """Home page with links to API endpoints"""
@@ -406,10 +418,12 @@ def home():
 if __name__ == "__main__":
     logger.info(" Starting Storage Service on port 8091")
     
-    # FIX FOR ISSUE 1: Initialize database with retry logic
+    # Initialize database with retry logic 
     init_db()
     
-    # FIX FOR ISSUE 2 & 3: Start background Kafka consumer thread
+    # Start background Kafka consumer thread (creates consumer on first use)
     setup_kafka_thread()
+    
+    logger.info("✅ Storage service ready. Starting API server...")
     
     app.run(host="0.0.0.0", port=8091)
