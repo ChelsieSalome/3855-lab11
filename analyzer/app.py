@@ -6,7 +6,7 @@ import logging
 import logging.config
 import yaml
 from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable, KafkaException
+from kafka.errors import NoBrokersAvailable, KafkaError
 import threading
 import time
 
@@ -88,7 +88,7 @@ class KafkaConsumerWrapper:
                 logger.info(f"[Analyzer Consumer] ✅ Successfully connected to Kafka")
                 return  # Connection successful
                 
-            except (NoBrokersAvailable, KafkaException) as e:
+            except (NoBrokersAvailable, KafkaError) as e:
                 logger.warning(f"[Analyzer Consumer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
                 
                 if attempt >= self.max_retries:
@@ -137,7 +137,7 @@ class KafkaConsumerWrapper:
             for msg in self.consumer:
                 yield msg.value
                 
-        except KafkaException as e:
+        except KafkaError as e:
             logger.error(f"[Analyzer Consumer] Kafka error: {e}")
             logger.warning("[Analyzer Consumer] Attempting to reconnect...")
             self.consumer = None

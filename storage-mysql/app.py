@@ -12,7 +12,7 @@ from models import PerformanceReading, ErrorReading
 from create_tables import make_session, init_db
 from sqlalchemy import select
 from kafka import KafkaConsumer
-from kafka.errors import KafkaException, NoBrokersAvailable
+from kafka.errors import KafkaError, NoBrokersAvailable
 
 
 with open('/config/storage_config.yml', 'r') as f:
@@ -101,7 +101,7 @@ class KafkaConsumerWrapper:
                 logger.info(f"[Consumer] ✅ Successfully connected to Kafka at {self.kafka_server}")
                 return  # Connection successful, exit retry loop
                 
-            except (NoBrokersAvailable, KafkaException) as e:
+            except (NoBrokersAvailable, KafkaError) as e:
                 logger.warning(f"[Consumer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
                 
                 if attempt >= self.max_retries:
@@ -146,7 +146,7 @@ class KafkaConsumerWrapper:
                         # Don't commit on error - message will be reprocessed
                         yield None, False
                         
-            except KafkaException as e:
+            except KafkaError as e:
                 logger.error(f"[Consumer] Kafka error in consumer loop: {e}")
                 logger.warning("[Consumer] Attempting to reconnect...")
                 self.is_connected = False

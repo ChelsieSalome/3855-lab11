@@ -9,7 +9,7 @@ import datetime
 import time
 import random
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable, KafkaException
+from kafka.errors import NoBrokersAvailable, KafkaError
 
 with open('/config/receiver_config.yml', 'r') as f:
     app_config = yaml.safe_load(f.read())
@@ -83,7 +83,7 @@ class KafkaProducerWrapper:
                 logger.info(f"[Producer] ✅ Successfully connected to Kafka at {self.kafka_server}")
                 return  # Connection successful, exit the retry loop
                 
-            except (NoBrokersAvailable, KafkaException) as e:
+            except (NoBrokersAvailable, KafkaError) as e:
                 logger.warning(f"[Producer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
                 
                 if attempt >= self.max_retries:
