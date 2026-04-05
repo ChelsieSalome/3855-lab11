@@ -38,14 +38,14 @@ def get_stats():
         return {"message": "Statistics do not exist"}, 404  
 
 
+def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}, 200
+
+
 first_run = True
 
 def populate_stats():
-    """
-    Periodic task to collect and aggregate statistics from all services.
-    
-    FIX FOR ISSUE 5: Added consistency validation to check for data loss
-    """
     global first_run  
     logger.info("Periodic processing has started")  
     
@@ -141,118 +141,7 @@ def populate_stats():
         json.dump(stats, f, indent=4)
     
     logger.debug(f"Updated statistics: {stats}")  
-    
-    # ==========================================
-    # ISSUE 5 FIX: Consistency Validation
-    # ==========================================
-    # Check if event counts are consistent across all services
-    # This helps detect data loss or processing bugs
-    validate_consistency(stats)
-    
     logger.info("Periodic processing has ended")
-
-
-def validate_consistency(current_stats):
-    """
-    Validate that event counts are consistent across all services.
-    
-    FIX FOR ISSUE 5: Detect data loss or inconsistencies
-    
-    Checks:
-    1. Performance events: received = stored in DB = reported by analyzer
-    2. Error events: received = stored in DB = reported by analyzer
-    3. Aggregated stats: match the totals from analyzer
-    
-    If counts don't match, logs a WARNING so you can investigate.
-    """
-    logger.info("=" * 60)
-    logger.info("CONSISTENCY VALIDATION CHECK")
-    logger.info("=" * 60)
-    
-    try:
-        # Get current stats from this service
-        processing_perf_count = current_stats['num_performance_readings']
-        processing_error_count = current_stats['num_error_readings']
-        
-        logger.info(f"Processing Service counts:")
-        logger.info(f"  - Performance events: {processing_perf_count}")
-        logger.info(f"  - Error events: {processing_error_count}")
-        
-        # Try to get stats from Analyzer service
-        try:
-            analyzer_response = requests.get('http://analyzer-service:5005/analyzer/stats', timeout=5)
-            if analyzer_response.status_code == 200:
-                analyzer_stats = analyzer_response.json()
-                analyzer_perf_count = analyzer_stats.get('num_performance_events', 0)
-                analyzer_error_count = analyzer_stats.get('num_error_events', 0)
-                
-                logger.info(f"Analyzer Service counts:")
-                logger.info(f"  - Performance events: {analyzer_perf_count}")
-                logger.info(f"  - Error events: {analyzer_error_count}")
-                
-                # Check for mismatches
-                if processing_perf_count != analyzer_perf_count:
-                    logger.warning(f"⚠️  MISMATCH: Performance count differs!")
-                    logger.warning(f"   Processing: {processing_perf_count}, Analyzer: {analyzer_perf_count}")
-                    logger.warning(f"   Difference: {abs(processing_perf_count - analyzer_perf_count)}")
-                else:
-                    logger.info(f"✅ Performance counts match: {processing_perf_count}")
-                
-                if processing_error_count != analyzer_error_count:
-                    logger.warning(f"⚠️  MISMATCH: Error count differs!")
-                    logger.warning(f"   Processing: {processing_error_count}, Analyzer: {analyzer_error_count}")
-                    logger.warning(f"   Difference: {abs(processing_error_count - analyzer_error_count)}")
-                else:
-                    logger.info(f"✅ Error counts match: {processing_error_count}")
-            else:
-                logger.warning(f"Could not get Analyzer stats: HTTP {analyzer_response.status_code}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Could not connect to Analyzer service: {e}")
-        
-        # Try to get counts from Storage service
-        try:
-            now = datetime.now(timezone.utc)
-            two_days_ago = datetime(2000, 1, 1, 0, 0, 0)  # Go back far enough to get all data
-            
-            params = {
-                'start_timestamp': two_days_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'end_timestamp': now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            }
-            
-            perf_response = requests.get(
-                'http://storage-service:8091/monitoring/performance',
-                params=params,
-                timeout=5
-            )
-            
-            error_response = requests.get(
-                'http://storage-service:8091/monitoring/errors',
-                params=params,
-                timeout=5
-            )
-            
-            if perf_response.status_code == 200 and error_response.status_code == 200:
-                storage_perf_count = len(perf_response.json())
-                storage_error_count = len(error_response.json())
-                
-                logger.info(f"Storage Service counts:")
-                logger.info(f"  - Performance events: {storage_perf_count}")
-                logger.info(f"  - Error events: {storage_error_count}")
-                
-                # Note: Storage counts will generally be higher because it stores everything
-                # that comes through Kafka. Processing service only counts incremental events.
-                logger.info(f"Note: Storage typically has all historical events.")
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Could not connect to Storage service: {e}")
-        
-        logger.info("=" * 60)
-        logger.info("CONSISTENCY CHECK COMPLETE")
-        logger.info("=" * 60)
-        
-    except Exception as e:
-        logger.error(f"Error during consistency validation: {e}")
 
 
 def init_scheduler():  
@@ -263,15 +152,14 @@ def init_scheduler():
     sched.start()
 
 
+# CREATE THE APP FIRST (but don't add API yet)
 app = connexion.FlaskApp(__name__, specification_dir='')
-
-# Enable CORS
 CORS(app.app)
 
+# NOW ADD THE API AFTER ALL FUNCTIONS ARE DEFINED
 app.add_api("processing_openapi.yaml", strict_validation=True, validate_responses=True)
 
 
 if __name__ == "__main__":
-    logger.info("Starting Processing Service on port 8100")
     init_scheduler() 
     app.run(port=8100)

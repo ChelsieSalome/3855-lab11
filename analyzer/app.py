@@ -27,30 +27,12 @@ logging.getLogger('kafka').setLevel(logging.WARNING)
 logger.info("Analyzer service configuration loaded")
 
 
-# ==========================================
-# ISSUE 2 & 3 FIX: Kafka Consumer Wrapper
-# ==========================================
-# Instead of creating a new consumer for each request (which is slow),
-# we create ONE consumer at startup that's reused by all endpoints.
-# It includes automatic reconnection with exponential backoff.
-
 class KafkaConsumerWrapper:
     """
     Wrapper around Kafka consumer that handles connection failures gracefully.
-    
-    FIX FOR ISSUE 2: Single consumer reused instead of creating new ones
-    FIX FOR ISSUE 3: Automatic reconnection with exponential backoff
     """
     
     def __init__(self, topic, bootstrap_servers, max_retries=10):
-        """
-        Initialize the consumer wrapper.
-        
-        Args:
-            topic: Kafka topic to subscribe to
-            bootstrap_servers: Kafka server address (hostname:port)
-            max_retries: Maximum connection attempts before giving up
-        """
         self.topic = topic
         self.bootstrap_servers = bootstrap_servers
         self.max_retries = max_retries
@@ -58,35 +40,27 @@ class KafkaConsumerWrapper:
         self._connect()
     
     def _connect(self):
-        """
-        Connect to Kafka with retry logic and exponential backoff.
-        
-        Strategy: Infinite retry with backoff because:
-        - Kafka is essential for this service
-        - Exponential backoff prevents hammering Kafka
-        - Service will work once Kafka is available
-        """
+        """Connect to Kafka with retry logic and exponential backoff."""
         attempt = 1
         
         while True:
             try:
                 logger.info(f"[Analyzer Consumer] Connection attempt {attempt}/{self.max_retries}")
                 
-                # Create consumer with proper settings
                 self.consumer = KafkaConsumer(
                     self.topic,
                     bootstrap_servers=self.bootstrap_servers,
                     group_id='analyzer_group',
                     auto_offset_reset='earliest',
                     enable_auto_commit=False,
-                    consumer_timeout_ms=1000,  # Don't block forever if no messages
+                    consumer_timeout_ms=1000,
                     value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                    session_timeout_ms=30000,  # 30 second session timeout
-                    heartbeat_interval_ms=10000  # Heartbeat every 10 seconds
+                    session_timeout_ms=30000,
+                    heartbeat_interval_ms=10000
                 )
                 
                 logger.info(f"[Analyzer Consumer] ✅ Successfully connected to Kafka")
-                return  # Connection successful
+                return
                 
             except (NoBrokersAvailable, KafkaError) as e:
                 logger.warning(f"[Analyzer Consumer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
@@ -95,36 +69,15 @@ class KafkaConsumerWrapper:
                     logger.error(f"[Analyzer Consumer] Could not connect after {self.max_retries} attempts.")
                     raise Exception(f"Kafka connection failed after {self.max_retries} retries")
                 
-                # Exponential backoff: 1s, 2s, 4s, 8s, etc. (capped at 32s)
                 wait_time = min(2 ** (attempt - 1), 32)
                 logger.info(f"[Analyzer Consumer] Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
                 attempt += 1
     
-    def seek_to_beginning(self):
+    def get_all_messages(self):
         """
-        Seek to the beginning of all partitions.
-        
-        Used when we need to re-read all messages from the start.
-        """
-        if self.consumer is None:
-            logger.warning("[Analyzer Consumer] Consumer is None, cannot seek")
-            return
-        
-        try:
-            self.consumer.seek_to_beginning()
-        except KafkaError as e:
-            logger.error(f"[Analyzer Consumer] Error seeking to beginning: {e}")
-            self.consumer = None
-            self._connect()
-    
-    def poll_and_process(self):
-        """
-        Poll for messages from Kafka.
-        If Kafka fails, automatically reconnect.
-        
-        Yields:
-            Message data (dict) if available, None if timeout
+        Read all messages from Kafka, starting from the beginning.
+        Handles partition assignment automatically.
         """
         if self.consumer is None:
             try:
@@ -134,6 +87,10 @@ class KafkaConsumerWrapper:
                 return
         
         try:
+            # Seek to beginning - this triggers partition assignment
+            self.consumer.seek_to_beginning()
+            
+            # Now iterate through all messages
             for msg in self.consumer:
                 yield msg.value
                 
@@ -159,17 +116,8 @@ except Exception as e:
     kafka_consumer = None
 
 
-# ==========================================
-# REQUEST HANDLER FUNCTIONS
-# ==========================================
-
 def get_performance_event(index):
-    """
-    Gets a performance event at a specific index.
-    
-    FIX FOR ISSUE 2: Uses global consumer instead of creating new one
-    FIX FOR ISSUE 3: Consumer automatically reconnects if needed
-    """
+    """Gets a performance event at a specific index."""
     logger.info(f"Request for performance event at index {index}")
     
     if kafka_consumer is None:
@@ -177,12 +125,10 @@ def get_performance_event(index):
         return {"message": "Service unavailable"}, 503
     
     try:
-        # Seek to beginning to ensure we read all messages
-        kafka_consumer.seek_to_beginning()
         performance_count = 0
         
-        # Iterate through messages
-        for msg_data in kafka_consumer.poll_and_process():
+        # Iterate through all messages from the beginning
+        for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
             
@@ -203,12 +149,7 @@ def get_performance_event(index):
 
 
 def get_error_event(index):
-    """
-    Gets an error event at a specific index.
-    
-    FIX FOR ISSUE 2: Uses global consumer instead of creating new one
-    FIX FOR ISSUE 3: Consumer automatically reconnects if needed
-    """
+    """Gets an error event at a specific index."""
     logger.info(f"Request for error event at index {index}")
     
     if kafka_consumer is None:
@@ -216,12 +157,10 @@ def get_error_event(index):
         return {"message": "Service unavailable"}, 503
     
     try:
-        # Seek to beginning to ensure we read all messages
-        kafka_consumer.seek_to_beginning()
         error_count = 0
         
-        # Iterate through messages
-        for msg_data in kafka_consumer.poll_and_process():
+        # Iterate through all messages from the beginning
+        for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
             
@@ -242,12 +181,7 @@ def get_error_event(index):
 
 
 def get_stats():
-    """
-    Gets statistics about events in the Kafka queue.
-    
-    FIX FOR ISSUE 2: Uses global consumer instead of creating new one
-    FIX FOR ISSUE 3: Consumer automatically reconnects if needed
-    """
+    """Gets statistics about events in the Kafka queue."""
     logger.info("Request for event statistics")
     
     if kafka_consumer is None:
@@ -255,15 +189,11 @@ def get_stats():
         return {"message": "Service unavailable"}, 503
     
     try:
-        # Seek to beginning to read all messages
-        kafka_consumer.seek_to_beginning()
-        
-        # Initialize counts
         performance_count = 0
         error_count = 0
         
-        # Iterate through all messages
-        for msg_data in kafka_consumer.poll_and_process():
+        # Iterate through all messages from the beginning
+        for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
             
@@ -291,16 +221,9 @@ def health():
     return {"status": "healthy"}, 200
 
 
-# ==========================================
-# CONNEXION APP SETUP
-# ==========================================
-
+# Define health BEFORE loading the API
 app = FlaskApp(__name__, specification_dir='')
-
-# Enable CORS
 CORS(app.app)
-
-# Add API with base path
 app.add_api(
     'openapi.yaml',
     base_path='/analyzer',
