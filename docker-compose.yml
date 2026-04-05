@@ -11,9 +11,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 40s  # INCREASED: Give Zookeeper more time to fully initialize
+      start_period: 20s
     volumes:
-      - zookeeper-data:/data
+      - zookeeper-data:/data  #lab9
 
   kafka:
     image: wurstmeister/kafka
@@ -27,7 +27,7 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
       KAFKA_CREATE_TOPICS: "events:1:1"
-    volumes:
+    volumes: #lab9
       - kafka-data:/kafka 
     depends_on:
       zookeeper:
@@ -39,7 +39,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 60s  # INCREASED: Give Kafka more time to connect to Zookeeper
+      start_period: 30s
 
   db:
     image: mysql
@@ -65,6 +65,8 @@ services:
     build:
       context: storage-mysql
       dockerfile: Dockerfile
+    #ports:
+     # - "8091:8091"  
     depends_on:
       db:
         condition: service_healthy
@@ -78,7 +80,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
-    volumes:
+    volumes: #lab9
       - ./config:/config  
       - ./logs:/logs
 
@@ -93,7 +95,7 @@ services:
         condition: service_healthy
     networks:
       - app-network
-    volumes:
+    volumes: #lab9
       - ./config:/config  
       - ./logs:/logs
 
@@ -108,10 +110,16 @@ services:
         condition: service_healthy
     networks:
       - app-network
-    volumes:
+    volumes: #lab9
       - ./config:/config  
       - ./logs:/logs
-      - ./data/processing:/data  
+      - ./data/processing:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   analyzer-service:
     build:
@@ -124,21 +132,25 @@ services:
         condition: service_healthy
     networks:
       - app-network
-    volumes:
+    volumes: #lab9
       - ./config:/config  
       - ./logs:/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5005/analyzer/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
-  dashboard:
+  dashboard:  #lab10
     build:
       context: dashboard
       dockerfile: Dockerfile
     ports:
       - "80:80"
     depends_on:
-      processing-service:
-        condition: service_healthy
-      analyzer-service:
-        condition: service_healthy
+      - processing-service
+      - analyzer-service
     networks:
       - app-network
     healthcheck:
@@ -154,5 +166,5 @@ networks:
 
 volumes:
   mysql-data:
-  kafka-data:
-  zookeeper-data:
+  kafka-data:      #lab9
+  zookeeper-data:  #lab9
