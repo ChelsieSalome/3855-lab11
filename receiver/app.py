@@ -238,6 +238,11 @@ def report_error_metrics(body):
         return {"error": str(e)}, 500
 
 
+def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}, 200
+
+
 app = connexion.FlaskApp(__name__, specification_dir='')
 app.add_api("receiver_openapi.yaml",
             strict_validation=True,

@@ -113,7 +113,7 @@ class KafkaConsumerWrapper:
         
         try:
             self.consumer.seek_to_beginning()
-        except KafkaException as e:
+        except KafkaError as e:
             logger.error(f"[Analyzer Consumer] Error seeking to beginning: {e}")
             self.consumer = None
             self._connect()
