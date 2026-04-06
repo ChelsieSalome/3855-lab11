@@ -7,7 +7,6 @@ import logging.config
 import yaml
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable, KafkaError
-import threading
 import time
 
 # Load configuration
@@ -28,9 +27,7 @@ logger.info("Analyzer service configuration loaded")
 
 
 class KafkaConsumerWrapper:
-    """
-    Wrapper around Kafka consumer that handles connection failures gracefully.
-    """
+    """Wrapper around Kafka consumer with retry logic."""
     
     def __init__(self, topic, bootstrap_servers, max_retries=10):
         self.topic = topic
@@ -42,11 +39,9 @@ class KafkaConsumerWrapper:
     def _connect(self):
         """Connect to Kafka with retry logic and exponential backoff."""
         attempt = 1
-        
         while True:
             try:
-                logger.info(f"[Analyzer Consumer] Connection attempt {attempt}/{self.max_retries}")
-                
+                logger.info(f"[Analyzer] Connection attempt {attempt}/{self.max_retries}")
                 self.consumer = KafkaConsumer(
                     self.topic,
                     bootstrap_servers=self.bootstrap_servers,
@@ -58,36 +53,41 @@ class KafkaConsumerWrapper:
                     session_timeout_ms=30000,
                     heartbeat_interval_ms=10000
                 )
-                
-                logger.info(f"[Analyzer Consumer] ✅ Successfully connected to Kafka")
+                logger.info(f"[Analyzer] ✅ Successfully connected to Kafka")
                 return
                 
             except (NoBrokersAvailable, KafkaError) as e:
-                logger.warning(f"[Analyzer Consumer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
-                
+                logger.warning(f"[Analyzer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
                 if attempt >= self.max_retries:
-                    logger.error(f"[Analyzer Consumer] Could not connect after {self.max_retries} attempts.")
+                    logger.error(f"[Analyzer] Could not connect after {self.max_retries} attempts.")
                     raise Exception(f"Kafka connection failed after {self.max_retries} retries")
                 
                 wait_time = min(2 ** (attempt - 1), 32)
-                logger.info(f"[Analyzer Consumer] Retrying in {wait_time} seconds...")
+                logger.info(f"[Analyzer] Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
                 attempt += 1
     
     def get_all_messages(self):
         """
-        Read all messages from Kafka, starting from the beginning.
-        Handles partition assignment automatically.
+        Read all messages from Kafka starting from the beginning.
+        
+        **CRITICAL**: Must poll() BEFORE seek_to_beginning() to trigger partition assignment.
+        This is the FIX for "No partitions are currently assigned".
         """
         if self.consumer is None:
             try:
                 self._connect()
             except Exception as e:
-                logger.error(f"[Analyzer Consumer] Cannot connect: {e}")
+                logger.error(f"[Analyzer] Cannot connect: {e}")
                 return
         
         try:
-            # Seek to beginning - this triggers partition assignment
+            # CRITICAL FIX: Poll FIRST to trigger partition assignment
+            logger.debug("[Analyzer] Polling to trigger partition assignment...")
+            self.consumer.poll(timeout_ms=100)
+            
+            # NOW seek to beginning - partitions are assigned
+            logger.debug("[Analyzer] Seeking to beginning...")
             self.consumer.seek_to_beginning()
             
             # Now iterate through all messages
@@ -95,16 +95,16 @@ class KafkaConsumerWrapper:
                 yield msg.value
                 
         except KafkaError as e:
-            logger.error(f"[Analyzer Consumer] Kafka error: {e}")
-            logger.warning("[Analyzer Consumer] Attempting to reconnect...")
+            logger.error(f"[Analyzer] Kafka error: {e}")
+            logger.warning("[Analyzer] Attempting to reconnect...")
             self.consumer = None
             try:
                 self._connect()
             except Exception as reconnect_error:
-                logger.error(f"[Analyzer Consumer] Reconnection failed: {reconnect_error}")
+                logger.error(f"[Analyzer] Reconnection failed: {reconnect_error}")
 
 
-# Create global consumer wrapper at module startup
+# Create global consumer at module startup
 kafka_server = f"{CONFIG['kafka']['hostname']}:{CONFIG['kafka']['port']}"
 kafka_topic = CONFIG['kafka']['topic']
 
@@ -126,20 +126,15 @@ def get_performance_event(index):
     
     try:
         performance_count = 0
-        
-        # Iterate through all messages from the beginning
         for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
-            
-            # Check if this is a performance event
             if msg_data.get('type') == 'performance_metric':
                 if performance_count == index:
                     logger.info(f"Found performance event at index {index}")
                     return msg_data['payload'], 200
                 performance_count += 1
         
-        # If we get here, index not found
         logger.error(f"No performance event found at index {index}")
         return {"message": f"No performance event at index {index}"}, 404
         
@@ -158,20 +153,15 @@ def get_error_event(index):
     
     try:
         error_count = 0
-        
-        # Iterate through all messages from the beginning
         for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
-            
-            # Check if this is an error event
             if msg_data.get('type') == 'error_metric':
                 if error_count == index:
                     logger.info(f"Found error event at index {index}")
                     return msg_data['payload'], 200
                 error_count += 1
         
-        # If we get here, index not found
         logger.error(f"No error event found at index {index}")
         return {"message": f"No error event at index {index}"}, 404
         
@@ -192,12 +182,9 @@ def get_stats():
         performance_count = 0
         error_count = 0
         
-        # Iterate through all messages from the beginning
         for msg_data in kafka_consumer.get_all_messages():
             if msg_data is None:
                 break
-            
-            # Count by type
             if msg_data.get('type') == 'performance_metric':
                 performance_count += 1
             elif msg_data.get('type') == 'error_metric':
@@ -221,7 +208,6 @@ def health():
     return {"status": "healthy"}, 200
 
 
-# Define health BEFORE loading the API
 app = FlaskApp(__name__, specification_dir='')
 CORS(app.app)
 app.add_api(
