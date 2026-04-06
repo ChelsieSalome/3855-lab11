@@ -8,6 +8,7 @@ import yaml
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable, KafkaError
 import time
+import threading
 
 # Load configuration
 with open('/config/analyzer_config.yml', 'r') as f:
@@ -27,13 +28,17 @@ logger.info("Analyzer service configuration loaded")
 
 
 class KafkaConsumerWrapper:
-    """Wrapper around Kafka consumer with retry logic."""
+    """
+    Thread-safe wrapper around Kafka consumer.
+    Uses a lock to prevent concurrent access issues.
+    """
     
     def __init__(self, topic, bootstrap_servers, max_retries=10):
         self.topic = topic
         self.bootstrap_servers = bootstrap_servers
         self.max_retries = max_retries
         self.consumer = None
+        self.lock = threading.RLock()  # Reentrant lock for thread safety
         self._connect()
     
     def _connect(self):
@@ -70,38 +75,48 @@ class KafkaConsumerWrapper:
     def get_all_messages(self):
         """
         Read all messages from Kafka starting from the beginning.
+        Thread-safe - uses lock to prevent concurrent access.
         
-        **CRITICAL**: Must poll() BEFORE seek_to_beginning() to trigger partition assignment.
-        This is the FIX for "No partitions are currently assigned".
+        CRITICAL: Does NOT use generators (causes "generator already executing" error).
+        Instead, reads all messages into a list under a lock.
         """
-        if self.consumer is None:
+        with self.lock:  # Acquire lock - only one request can do this at a time
+            if self.consumer is None:
+                try:
+                    self._connect()
+                except Exception as e:
+                    logger.error(f"[Analyzer] Cannot connect: {e}")
+                    return []
+            
             try:
-                self._connect()
-            except Exception as e:
-                logger.error(f"[Analyzer] Cannot connect: {e}")
-                return
-        
-        try:
-            # CRITICAL FIX: Poll FIRST to trigger partition assignment
-            logger.debug("[Analyzer] Polling to trigger partition assignment...")
-            self.consumer.poll(timeout_ms=100)
-            
-            # NOW seek to beginning - partitions are assigned
-            logger.debug("[Analyzer] Seeking to beginning...")
-            self.consumer.seek_to_beginning()
-            
-            # Now iterate through all messages
-            for msg in self.consumer:
-                yield msg.value
+                # CRITICAL FIX: Poll FIRST to trigger partition assignment
+                logger.debug("[Analyzer] Polling to trigger partition assignment...")
+                self.consumer.poll(timeout_ms=100)
                 
-        except KafkaError as e:
-            logger.error(f"[Analyzer] Kafka error: {e}")
-            logger.warning("[Analyzer] Attempting to reconnect...")
-            self.consumer = None
-            try:
-                self._connect()
-            except Exception as reconnect_error:
-                logger.error(f"[Analyzer] Reconnection failed: {reconnect_error}")
+                # NOW seek to beginning - partitions are assigned
+                logger.debug("[Analyzer] Seeking to beginning...")
+                self.consumer.seek_to_beginning()
+                
+                # Read ALL messages into a list (not a generator)
+                # This prevents "generator already executing" errors
+                messages = []
+                for msg in self.consumer:
+                    if msg is None:
+                        break
+                    messages.append(msg.value)
+                
+                logger.debug(f"[Analyzer] Read {len(messages)} messages from Kafka")
+                return messages
+                    
+            except KafkaError as e:
+                logger.error(f"[Analyzer] Kafka error: {e}")
+                logger.warning("[Analyzer] Attempting to reconnect...")
+                self.consumer = None
+                try:
+                    self._connect()
+                except Exception as reconnect_error:
+                    logger.error(f"[Analyzer] Reconnection failed: {reconnect_error}")
+                return []
 
 
 # Create global consumer at module startup
@@ -125,10 +140,11 @@ def get_performance_event(index):
         return {"message": "Service unavailable"}, 503
     
     try:
+        # Get all messages (thread-safe, no generators)
+        all_messages = kafka_consumer.get_all_messages()
+        
         performance_count = 0
-        for msg_data in kafka_consumer.get_all_messages():
-            if msg_data is None:
-                break
+        for msg_data in all_messages:
             if msg_data.get('type') == 'performance_metric':
                 if performance_count == index:
                     logger.info(f"Found performance event at index {index}")
@@ -152,10 +168,11 @@ def get_error_event(index):
         return {"message": "Service unavailable"}, 503
     
     try:
+        # Get all messages (thread-safe, no generators)
+        all_messages = kafka_consumer.get_all_messages()
+        
         error_count = 0
-        for msg_data in kafka_consumer.get_all_messages():
-            if msg_data is None:
-                break
+        for msg_data in all_messages:
             if msg_data.get('type') == 'error_metric':
                 if error_count == index:
                     logger.info(f"Found error event at index {index}")
@@ -179,12 +196,13 @@ def get_stats():
         return {"message": "Service unavailable"}, 503
     
     try:
+        # Get all messages (thread-safe, no generators)
+        all_messages = kafka_consumer.get_all_messages()
+        
         performance_count = 0
         error_count = 0
         
-        for msg_data in kafka_consumer.get_all_messages():
-            if msg_data is None:
-                break
+        for msg_data in all_messages:
             if msg_data.get('type') == 'performance_metric':
                 performance_count += 1
             elif msg_data.get('type') == 'error_metric':
