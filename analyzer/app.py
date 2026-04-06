@@ -1,10 +1,10 @@
 """
 Analyzer Service - app.py
-Lab 11 fix:
-  - Messages are cached in memory and refreshed by a background thread every 2s.
-  - API endpoints read from the cache instantly — no Kafka seek on every request.
-  - /health never touches Kafka, so the health check never times out.
-  - Thread lock only protects the cache swap, not a full Kafka read.
+Lab 11 fixes:
+  - Background thread caches all Kafka messages in memory every 2s.
+  - Waits for partition assignment before seek_to_beginning (fixes "No partitions assigned" error).
+  - API endpoints read from cache instantly — no per-request Kafka I/O.
+  - /health never touches Kafka or the cache.
 """
 
 import connexion
@@ -29,94 +29,99 @@ with open('/config/analyzer_log_config.yml', 'r') as f:
     logging.config.dictConfig(yaml.safe_load(f))
 
 logger = logging.getLogger('basicLogger')
-
 logging.getLogger('kafka').setLevel(logging.WARNING)
 
 KAFKA_SERVER = f"{CONFIG['kafka']['hostname']}:{CONFIG['kafka']['port']}"
 KAFKA_TOPIC  = CONFIG['kafka']['topic']
 
-# ── In-memory message cache ───────────────────────────────────────────────────
-# Background thread writes here; API handlers read from here instantly.
+# ── In-memory cache ───────────────────────────────────────────────────────────
 
-_cache_lock     = threading.Lock()
-_cached_messages: list[dict] = []   # list of raw message value dicts
+_cache_lock              = threading.Lock()
+_cached_messages: list   = []
 
 
-def _create_consumer() -> KafkaConsumer:
-    """Retry with exponential backoff until Kafka is reachable."""
+def _make_consumer() -> KafkaConsumer:
+    """Connect to Kafka, retrying with exponential backoff."""
     delay = 1
     attempt = 0
     while True:
         attempt += 1
         try:
-            consumer = KafkaConsumer(
+            c = KafkaConsumer(
                 KAFKA_TOPIC,
                 bootstrap_servers=KAFKA_SERVER,
-                group_id='analyzer_group',
+                # No group_id so we get a fresh, independent consumer
+                # that always reads from the beginning without interfering
+                # with the storage consumer group.
+                group_id=None,
                 auto_offset_reset='earliest',
                 enable_auto_commit=False,
-                consumer_timeout_ms=500,    # stop iterating quickly when caught up
+                consumer_timeout_ms=1000,
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
             )
-            logger.info(f"Kafka consumer connected on attempt {attempt}")
-            return consumer
+            logger.info(f"Kafka consumer connected (attempt {attempt})")
+            return c
         except (NoBrokersAvailable, KafkaError) as e:
-            logger.warning(f"Kafka not available (attempt {attempt}): {e}. Retrying in {delay}s")
+            logger.warning(f"Kafka unavailable (attempt {attempt}): {e}. Retry in {delay}s")
             time.sleep(delay)
             delay = min(delay * 2, 32)
         except Exception as e:
-            logger.error(f"Unexpected error creating consumer: {e}. Retrying in {delay}s")
+            logger.error(f"Unexpected Kafka error (attempt {attempt}): {e}. Retry in {delay}s")
             time.sleep(delay)
             delay = min(delay * 2, 32)
 
 
 def _refresh_cache():
     """
-    Background daemon thread.
-    Reads ALL messages from Kafka every 2 seconds and updates the cache.
-    Reconnects automatically on failure.
+    Background daemon: reads ALL Kafka messages every 2 s and updates the cache.
+    Uses group_id=None so we get our own offset pointer and never need seek_to_beginning
+    across a group rebalance — partition assignment is immediate.
     """
     global _cached_messages
     logger.info("Cache refresh thread started")
 
-    consumer = _create_consumer()
-
     while True:
+        consumer = _make_consumer()
         try:
-            # Seek to beginning and drain all current messages
-            consumer.poll(timeout_ms=100)   # ensure partition assignment
-            consumer.seek_to_beginning()
+            while True:
+                # poll() triggers partition assignment; then we can seek safely
+                consumer.poll(timeout_ms=500)
 
-            messages = []
-            for msg in consumer:            # stops when consumer_timeout_ms hit
-                messages.append(msg.value)
+                # Seek to beginning of every assigned partition
+                partitions = consumer.assignment()
+                if not partitions:
+                    # Partitions not yet assigned — poll again
+                    time.sleep(0.2)
+                    continue
 
-            with _cache_lock:
-                _cached_messages = messages
+                consumer.seek_to_beginning(*partitions)
 
-            logger.debug(f"Cache refreshed: {len(messages)} messages")
+                # Drain all messages
+                messages = []
+                for msg in consumer:        # stops when consumer_timeout_ms hit
+                    messages.append(msg.value)
+
+                with _cache_lock:
+                    _cached_messages = messages
+
+                logger.debug(f"Cache refreshed: {len(messages)} messages")
+                time.sleep(2)
 
         except Exception as e:
-            logger.error(f"Cache refresh error: {e}. Reconnecting in 5s …")
+            logger.error(f"Cache refresh error: {e}. Reconnecting in 3s …")
             try:
                 consumer.close()
             except Exception:
                 pass
-            time.sleep(5)
-            consumer = _create_consumer()
-
-        time.sleep(2)   # refresh every 2 seconds
+            time.sleep(3)
 
 
-# Start background cache thread immediately at import time
-_refresh_thread = threading.Thread(target=_refresh_cache, daemon=True)
-_refresh_thread.start()
+# Start background cache thread at import time
+_t = threading.Thread(target=_refresh_cache, daemon=True)
+_t.start()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_cached() -> list[dict]:
-    """Return a snapshot of the current cache."""
+def _snapshot() -> list:
     with _cache_lock:
         return list(_cached_messages)
 
@@ -126,51 +131,38 @@ def _get_cached() -> list[dict]:
 def get_performance_event(index: int):
     """GET /analyzer/performance?index=N"""
     logger.info(f"Request for performance event at index {index}")
-
-    messages    = _get_cached()
-    perf_events = [m['payload'] for m in messages if m.get('type') == 'performance_metric']
-
-    if index >= len(perf_events):
-        logger.error(f"No performance event at index {index} (total={len(perf_events)})")
+    events = [m['payload'] for m in _snapshot() if m.get('type') == 'performance_metric']
+    if index >= len(events):
+        logger.error(f"No performance event at index {index} (total={len(events)})")
         return {"message": f"No performance event at index {index}"}, 404
-
     logger.info(f"Returning performance event at index {index}")
-    return perf_events[index], 200
+    return events[index], 200
 
 
 def get_error_event(index: int):
     """GET /analyzer/error?index=N"""
     logger.info(f"Request for error event at index {index}")
-
-    messages     = _get_cached()
-    error_events = [m['payload'] for m in messages if m.get('type') == 'error_metric']
-
-    if index >= len(error_events):
-        logger.error(f"No error event at index {index} (total={len(error_events)})")
+    events = [m['payload'] for m in _snapshot() if m.get('type') == 'error_metric']
+    if index >= len(events):
+        logger.error(f"No error event at index {index} (total={len(events)})")
         return {"message": f"No error event at index {index}"}, 404
-
     logger.info(f"Returning error event at index {index}")
-    return error_events[index], 200
+    return events[index], 200
 
 
 def get_stats():
     """GET /analyzer/stats"""
     logger.info("Request for event statistics")
-
-    messages    = _get_cached()
-    perf_count  = sum(1 for m in messages if m.get('type') == 'performance_metric')
-    error_count = sum(1 for m in messages if m.get('type') == 'error_metric')
-
-    stats = {
-        "num_performance_events": perf_count,
-        "num_error_events":       error_count,
-    }
+    msgs        = _snapshot()
+    perf_count  = sum(1 for m in msgs if m.get('type') == 'performance_metric')
+    error_count = sum(1 for m in msgs if m.get('type') == 'error_metric')
+    stats = {"num_performance_events": perf_count, "num_error_events": error_count}
     logger.info(f"Stats: {stats}")
     return stats, 200
 
 
 def health():
-    """GET /analyzer/health — never touches Kafka, always instant."""
+    """GET /analyzer/health — always instant, never touches Kafka."""
     return {"status": "healthy"}, 200
 
 
