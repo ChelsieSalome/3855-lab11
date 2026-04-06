@@ -1,3 +1,11 @@
+"""
+Receiver Service - app.py
+Receives performance and error metric events, publishes them to Kafka.
+Lab 11 fixes:
+  - Single global KafkaProducer (created once at startup, reused for all events)
+  - Retry logic with exponential backoff so service survives Kafka restarts
+"""
+
 import connexion
 from connexion import NoContent
 import uuid
@@ -7,266 +15,184 @@ import logging.config
 import json
 import datetime
 import time
-import random
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable, KafkaError
+from kafka.errors import NoBrokersAvailable
+
+# ── Config & Logging ──────────────────────────────────────────────────────────
 
 with open('/config/receiver_config.yml', 'r') as f:
-    app_config = yaml.safe_load(f.read())
+    app_config = yaml.safe_load(f)
 
-with open("/config/receiver_log_config.yml", "r") as f:
-    LOG_CONFIG = yaml.safe_load(f.read())
-    logging.config.dictConfig(LOG_CONFIG)
+with open('/config/receiver_log_config.yml', 'r') as f:
+    logging.config.dictConfig(yaml.safe_load(f))
 
 logger = logging.getLogger('basicLogger')
 
+# Suppress noisy kafka-python internal logs
 logging.getLogger('kafka').setLevel(logging.WARNING)
 
-logger.info("Configuration loaded - Kafka DEBUG logs suppressed")
-
 KAFKA_SERVER = f"{app_config['events']['hostname']}:{app_config['events']['port']}"
-KAFKA_TOPIC = app_config['events']['topic']
+KAFKA_TOPIC  = app_config['events']['topic']
 
+# ── Global Kafka Producer (created ONCE, reused for every request) ────────────
 
-# ==========================================
-# ISSUE 2 & 3 FIX: Global Kafka Producer
-# ==========================================
-# Instead of creating a new producer for each event (which is slow),
-# we create ONE producer at startup and reuse it for all events.
-# This also includes retry logic - if Kafka is unavailable,
-# the producer will try to reconnect automatically.
-
-class KafkaProducerWrapper:
+def _create_producer():
     """
-    Wrapper around Kafka producer that handles connection failures gracefully.
-    
-    FIX FOR ISSUE 2: Reusing a single producer instead of creating new ones
-    FIX FOR ISSUE 3: Automatic reconnection with exponential backoff
+    Keep retrying with exponential backoff until Kafka is reachable.
+    Waits: 1s, 2s, 4s, 8s, 16s, 32s … (caps at 32s per attempt).
+    Never gives up – the container stays alive and reconnects automatically.
     """
-    
-    def __init__(self, kafka_server, max_retries=10):
-        """
-        Initialize the producer wrapper.
-        
-        Args:
-            kafka_server: Kafka server address (hostname:port)
-            max_retries: Maximum number of connection attempts before giving up
-        """
-        self.kafka_server = kafka_server
-        self.max_retries = max_retries
-        self.producer = None
-        self._connect()
-    
-    def _connect(self):
-        """
-        Connect to Kafka with retry logic and exponential backoff.
-        
-        Strategy: Infinite retry with backoff because:
-        - Kafka is essential; if it's not available, we MUST wait
-        - Exponential backoff prevents hammering Kafka with connection attempts
-        - Service will eventually start when Kafka becomes available
-        """
-        attempt = 1
-        
-        while True:
-            try:
-                logger.info(f"[Producer] Connection attempt {attempt}/{self.max_retries} to Kafka at {self.kafka_server}")
-                
-                # Create producer with timeout settings
-                self.producer = KafkaProducer(
-                    bootstrap_servers=self.kafka_server,
-                    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                    retries=3,  # Retry individual sends up to 3 times
-                    max_in_flight_requests_per_connection=1  # Ensure ordered delivery
-                )
-                
-                logger.info(f"[Producer] ✅ Successfully connected to Kafka at {self.kafka_server}")
-                return  # Connection successful, exit the retry loop
-                
-            except (NoBrokersAvailable, KafkaError) as e:
-                logger.warning(f"[Producer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
-                
-                if attempt >= self.max_retries:
-                    logger.error(f"[Producer] Could not connect after {self.max_retries} attempts. Giving up.")
-                    raise Exception(f"Kafka connection failed after {self.max_retries} retries")
-                
-                # Calculate backoff: 1s, 2s, 4s, 8s, etc. (exponential backoff)
-                wait_time = min(2 ** (attempt - 1), 32)  # Cap at 32 seconds
-                logger.info(f"[Producer] Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-                attempt += 1
-    
-    def send_message(self, topic, message):
-        """
-        Send a message to Kafka. If connection fails, automatically reconnect.
-        
-        Args:
-            topic: Kafka topic name
-            message: Message to send (will be JSON serialized)
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if self.producer is None:
-            logger.error("[Producer] Producer not initialized")
-            return False
-        
+    delay = 1
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            # Send message and wait for it to complete
-            future = self.producer.send(topic, value=message)
-            future.get(timeout=10)  # Wait up to 10 seconds for send to complete
-            self.producer.flush()  # Ensure it's written
-            return True
-            
-        except KafkaException as e:
-            logger.error(f"[Producer] Kafka error when sending message: {e}")
-            logger.warning("[Producer] Attempting to reconnect...")
-            try:
-                self._connect()  # Try to reconnect
-            except Exception as reconnect_error:
-                logger.error(f"[Producer] Reconnection failed: {reconnect_error}")
-            return False
-        
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_SERVER,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                # Keep the connection alive
+                connections_max_idle_ms=540000,
+                request_timeout_ms=30000,
+                retries=5,
+            )
+            logger.info(f"Kafka producer connected on attempt {attempt}")
+            return producer
+        except NoBrokersAvailable:
+            logger.warning(
+                f"Kafka not available (attempt {attempt}). Retrying in {delay}s …"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
         except Exception as e:
-            logger.error(f"[Producer] Unexpected error sending message: {e}")
-            return False
+            logger.error(f"Unexpected error connecting to Kafka: {e}. Retrying in {delay}s …")
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
 
 
-# Create the global producer at module startup
-# This is created ONCE when the app starts, not for each request
-try:
-    producer_wrapper = KafkaProducerWrapper(KAFKA_SERVER)
-    logger.info("✅ Global Kafka producer created successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to create global Kafka producer: {e}")
-    producer_wrapper = None
+logger.info("Connecting to Kafka …")
+_producer = _create_producer()
 
+
+def _send(msg: dict):
+    """Send one message, reconnecting if the producer has gone stale."""
+    global _producer
+    try:
+        _producer.send(KAFKA_TOPIC, value=msg)
+        _producer.flush()
+    except Exception as e:
+        logger.error(f"Kafka send failed: {e}. Reconnecting …")
+        _producer = _create_producer()
+        _producer.send(KAFKA_TOPIC, value=msg)
+        _producer.flush()
+
+
+# ── API Handlers ──────────────────────────────────────────────────────────────
 
 def report_performance_metrics(body):
-    """
-    Receive performance metrics and send to Kafka.
-    
-    FIX FOR ISSUE 2: Uses global producer instead of creating a new one per request
-    FIX FOR ISSUE 3: Uses producer wrapper that handles reconnection
-    """
+    """POST /monitoring/performance – receive a batch of performance metrics."""
     try:
-        server_id = body['server_id']
+        server_id           = body['server_id']
         reporting_timestamp = body['reporting_timestamp']
-        metrics = body['metrics']
 
-        for metric in metrics:
+        for metric in body['metrics']:
             trace_id = str(uuid.uuid4())
+            logger.info(
+                f"RECEIVED performance metric | server={server_id} trace={trace_id}"
+            )
 
-            logger.info(f"RECEIVED: Performance metric from server {server_id} (trace: {trace_id})")
-
-            individual_event = {
-                "trace_id": trace_id,
-                "server_id": server_id,
-                "cpu": metric['cpu'],
-                "memory": metric['memory'],
-                "disk_io": metric['disk_io'],
-                "reporting_timestamp": reporting_timestamp
+            payload = {
+                "trace_id":            trace_id,
+                "server_id":           server_id,
+                "cpu":                 metric['cpu'],
+                "memory":              metric['memory'],
+                "disk_io":             metric['disk_io'],
+                "reporting_timestamp": reporting_timestamp,
             }
 
-            msg = {
-                "type": "performance_metric",
+            _send({
+                "type":     "performance_metric",
                 "datetime": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                "payload": individual_event
-            }
+                "payload":  payload,
+            })
 
-            # FIX: Use global producer instead of creating new one
-            if producer_wrapper and producer_wrapper.send_message(KAFKA_TOPIC, msg):
-                logger.info(f"SENT TO KAFKA: Performance metric (trace: {trace_id})")
-            else:
-                logger.error(f"FAILED TO SEND: Performance metric (trace: {trace_id})")
-                return {"error": "Failed to send to Kafka"}, 500
+            logger.info(f"SENT performance metric to Kafka | trace={trace_id}")
 
         return NoContent, 201
-        
+
     except Exception as e:
         logger.error(f"Error processing performance metrics: {e}")
         return {"error": str(e)}, 500
 
 
 def report_error_metrics(body):
-    """
-    Receive error metrics and send to Kafka.
-    
-    FIX FOR ISSUE 2: Uses global producer instead of creating a new one per request
-    FIX FOR ISSUE 3: Uses producer wrapper that handles reconnection
-    """
+    """POST /monitoring/errors – receive a batch of error metrics."""
     try:
-        server_id = body['server_id']
+        server_id           = body['server_id']
         reporting_timestamp = body['reporting_timestamp']
-        errors = body['errors']
 
-        logger.info(f"RECEIVED: Error metrics from server {server_id}")
-
-        if not errors:
-            return NoContent, 201
-
-        for error in errors:
+        for error in body['errors']:
             trace_id = str(uuid.uuid4())
+            logger.info(
+                f"RECEIVED error metric | server={server_id} trace={trace_id}"
+            )
 
-            individual_event = {
-                "trace_id": trace_id,
-                "server_id": server_id,
-                "error_code": error['error_code'],
-                "severity_level": error['severity_level'],
-                "avg_response_time": error['avg_response_time'],
-                "error_message": error.get('error_message', ''),
-                "reporting_timestamp": reporting_timestamp
+            payload = {
+                "trace_id":            trace_id,
+                "server_id":           server_id,
+                "error_code":          error['error_code'],
+                "severity_level":      error['severity_level'],
+                "avg_response_time":   error['avg_response_time'],
+                "error_message":       error.get('error_message', ''),
+                "reporting_timestamp": reporting_timestamp,
             }
 
-            msg = {
-                "type": "error_metric",
+            _send({
+                "type":     "error_metric",
                 "datetime": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                "payload": individual_event
-            }
+                "payload":  payload,
+            })
 
-            # FIX: Use global producer instead of creating new one
-            if producer_wrapper and producer_wrapper.send_message(KAFKA_TOPIC, msg):
-                logger.info(f"SENT TO KAFKA: Error metric (trace: {trace_id}, code: {error['error_code']})")
-            else:
-                logger.error(f"FAILED TO SEND: Error metric (trace: {trace_id})")
-                return {"error": "Failed to send to Kafka"}, 500
+            logger.info(
+                f"SENT error metric to Kafka | trace={trace_id} code={error['error_code']}"
+            )
 
         return NoContent, 201
-        
+
     except Exception as e:
         logger.error(f"Error processing error metrics: {e}")
         return {"error": str(e)}, 500
 
 
 def health():
-    """Health check endpoint"""
+    """GET /health – liveness probe."""
     return {"status": "healthy"}, 200
 
 
+# ── App Setup ─────────────────────────────────────────────────────────────────
+
 app = connexion.FlaskApp(__name__, specification_dir='')
-app.add_api("receiver_openapi.yaml",
-            strict_validation=True,
-            validate_responses=True)
+app.add_api(
+    "receiver_openapi.yaml",
+    strict_validation=True,
+    validate_responses=True,
+)
 
 flask_app = app.app
+
+from flask_cors import CORS
+CORS(flask_app)
 
 
 @flask_app.route('/')
 def home():
-    """Home page with links to API endpoints"""
-    return '''
-    <html>
-    <head><title>Receiver Service</title></head>
-    <body>
-        <h1>Receiver Service</h1>
-        <h2>Available Endpoints:</h2>
-        <ul>
-            <li>POST /monitoring/performance</li>
-            <li>POST /monitoring/errors</li>
-        </ul>
-    </body>
-    </html>
-    '''
+    return (
+        "<h1>Receiver Service</h1>"
+        "<ul>"
+        "<li>POST /monitoring/performance</li>"
+        "<li>POST /monitoring/errors</li>"
+        "<li>GET  /health</li>"
+        "</ul>"
+    )
 
 
 if __name__ == "__main__":

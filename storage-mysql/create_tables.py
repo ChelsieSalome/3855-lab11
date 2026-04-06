@@ -1,3 +1,11 @@
+"""
+Storage Service - create_tables.py
+Creates the MySQL schema and provides a session factory.
+Lab 11 fix:
+  - Connection pooling: pool_size, max_overflow, pool_recycle, pool_pre_ping
+    prevents "Lost connection to MySQL server" errors after hours of uptime.
+"""
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from models import Base
@@ -6,88 +14,72 @@ import logging
 import logging.config
 import time
 
+# ── Config & Logging ──────────────────────────────────────────────────────────
 
-# Load configuration
 with open('/config/storage_config.yml', 'r') as f:
-    app_config = yaml.safe_load(f.read())
+    app_config = yaml.safe_load(f)
 
 db_conf = app_config['datastore']
 
-with open("/config/storage_log_config.yml", "r") as f:
-    LOG_CONFIG = yaml.safe_load(f.read())
-    logging.config.dictConfig(LOG_CONFIG)
+with open('/config/storage_log_config.yml', 'r') as f:
+    logging.config.dictConfig(yaml.safe_load(f))
 
 logger = logging.getLogger('basicLogger')
 
-# MySQL connection string
+# ── Engine (with connection pool settings) ────────────────────────────────────
+
 DATABASE_URL = (
     f"mysql+pymysql://{db_conf['user']}:{db_conf['password']}"
     f"@{db_conf['hostname']}:{db_conf['port']}/{db_conf['db']}"
 )
 
-logger.info(f"Database URL configured for {db_conf['hostname']}:{db_conf['port']}/{db_conf['db']}")
-
-# ==========================================
-# ISSUE 4 FIX: Database Connection Pooling
-# ==========================================
-# The problem: After a while, MySQL closes idle connections or the pool gets exhausted
-# Solution: Configure SQLAlchemy connection pool to handle this properly
-#
-# Key settings:
-# - pool_size: Number of persistent connections to maintain
-# - pool_recycle: Recycle connections every N seconds (default MySQL timeout is 28800s/8hrs)
-# - pool_pre_ping: Test connection before using it; reconnect if dead
-# - max_overflow: Allow extra connections above pool_size if needed
-
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    
-    # FIX FOR ISSUE 4: Pool configuration
-    pool_size=10,              # Keep 10 persistent connections in the pool
-    max_overflow=20,           # Allow up to 20 additional connections above pool_size
-    pool_recycle=3600,         # Recycle connections every 1 hour (before 8-hour timeout)
-    pool_pre_ping=True,        # Test connection before using (reconnect if dead)
-    connect_args={'connect_timeout': 10}  # Connection timeout of 10 seconds
+    # ── Pool settings (Lab 11 fix) ──────────────────────────────────────────
+    pool_size=10,           # keep 10 connections open and ready
+    max_overflow=20,        # allow up to 10+20=30 under burst load
+    pool_recycle=3600,      # recycle connections after 1 h (before MySQL's 8-h timeout)
+    pool_pre_ping=True,     # test each connection before use; replace dead ones silently
+    pool_timeout=30,        # wait up to 30 s for a connection from the pool
 )
 
-logger.info("✅ Database engine created with connection pooling configured")
-logger.info("   Pool settings: size=10, max_overflow=20, recycle=3600s, pre_ping=True")
+logger.info(
+    f"Database engine created | host={db_conf['hostname']}:{db_conf['port']} "
+    f"db={db_conf['db']}"
+)
+
+# ── Session factory ───────────────────────────────────────────────────────────
+
+_SessionFactory = sessionmaker(bind=engine)
 
 
 def make_session():
-    """
-    Create and return a new database session.
-    
-    FIX FOR ISSUE 4: Session will use the pooled connections with proper recycling
-    """
-    Session = sessionmaker(bind=engine)
-    return Session()
+    """Return a new SQLAlchemy session."""
+    return _SessionFactory()
 
 
-def init_db(retries=10, delay=5):
+# ── Table creation with retry ─────────────────────────────────────────────────
+
+def init_db(retries: int = 15, delay: int = 5):
     """
-    Wait for MySQL to be ready, then create tables.
-    Called explicitly at startup — NOT at import time.
-    
-    This addresses ISSUE 1 (dependencies) by waiting for MySQL to be ready
-    before initializing the app.
+    Wait for MySQL to be ready, then create all tables.
+    Call this once at service startup before starting the Kafka thread.
     """
     for attempt in range(1, retries + 1):
         try:
-            logger.info(f"MySQL connection attempt {attempt}/{retries}...")
-            # This actually tests the connection
+            logger.info(f"MySQL connection attempt {attempt}/{retries} …")
             Base.metadata.create_all(engine)
-            logger.info("✅ MySQL connected and tables created successfully")
-            return True
+            logger.info("MySQL connected and tables ready")
+            return
         except Exception as e:
             logger.warning(f"MySQL not ready (attempt {attempt}/{retries}): {e}")
             if attempt < retries:
-                logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
             else:
-                logger.error("❌ Could not connect to MySQL after all retries. Exiting.")
+                logger.error("Could not connect to MySQL after all retries – exiting")
                 raise
+
 
 if __name__ == "__main__":
     init_db()

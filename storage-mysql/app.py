@@ -1,429 +1,266 @@
+"""
+Storage Service - app.py
+Consumes events from Kafka and persists them to MySQL via SQLAlchemy.
+Lab 11 fixes:
+  - Single persistent KafkaConsumer running in a daemon thread
+  - Retry / reconnect logic with exponential backoff
+  - DB connection pooling via create_tables engine (pool_pre_ping, pool_recycle)
+"""
+
 import connexion
 from connexion import NoContent
 from datetime import datetime
-import functools
 import json
 import yaml
 import logging
-import logging.config 
+import logging.config
 import threading
 import time
+
 from models import PerformanceReading, ErrorReading
 from create_tables import make_session, init_db
 from sqlalchemy import select
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError, NoBrokersAvailable
+from flask_cors import CORS
 
+# ── Config & Logging ──────────────────────────────────────────────────────────
 
 with open('/config/storage_config.yml', 'r') as f:
-    app_config = yaml.safe_load(f.read())
+    app_config = yaml.safe_load(f)
 
 with open('/config/storage_log_config.yml', 'r') as f:
-    log_config = yaml.safe_load(f.read())
-    logging.config.dictConfig(log_config)
+    logging.config.dictConfig(yaml.safe_load(f))
 
 logger = logging.getLogger('basicLogger')
 
-# Suppress Kafka DEBUG logs
 logging.getLogger('kafka').setLevel(logging.WARNING)
 logging.getLogger('kafka.conn').setLevel(logging.WARNING)
-logging.getLogger('kafka.client').setLevel(logging.WARNING)
-logging.getLogger('kafka.consumer').setLevel(logging.WARNING)
-logging.getLogger('kafka.protocol').setLevel(logging.WARNING)
-logging.getLogger('kafka.coordinator').setLevel(logging.WARNING)
 
 KAFKA_SERVER = f"{app_config['events']['hostname']}:{app_config['events']['port']}"
-KAFKA_TOPIC = app_config['events']['topic']
+KAFKA_TOPIC  = app_config['events']['topic']
 
-logger.info("Storage service configuration loaded successfully")
-logger.info(f"Kafka: {KAFKA_SERVER}, Topic: {KAFKA_TOPIC}")
+logger.info(f"Storage service starting | Kafka={KAFKA_SERVER} topic={KAFKA_TOPIC}")
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _store_performance(payload: dict):
+    """Write one performance reading to the database."""
+    session = make_session()
+    try:
+        reading = PerformanceReading(
+            trace_id=payload['trace_id'],
+            server_id=payload['server_id'],
+            cpu=payload['cpu'],
+            memory=payload['memory'],
+            disk_io=payload['disk_io'],
+            reporting_timestamp=datetime.strptime(
+                payload['reporting_timestamp'], "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+        session.add(reading)
+        session.commit()
+        logger.info(
+            f"STORED performance | trace={payload['trace_id']} server={payload['server_id']}"
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"DB error storing performance: {e}")
+        raise
+    finally:
+        session.close()
 
 
-# ==========================================
-# ISSUE 2 & 3 FIX: Kafka Consumer Wrapper
-# ==========================================
-# Instead of creating a new consumer for each operation (which is slow),
-# we create ONE consumer at startup in a background thread.
-# If Kafka goes down, it automatically reconnects with exponential backoff.
+def _store_error(payload: dict):
+    """Write one error reading to the database."""
+    session = make_session()
+    try:
+        reading = ErrorReading(
+            trace_id=payload['trace_id'],
+            server_id=payload['server_id'],
+            error_code=payload['error_code'],
+            severity_level=payload['severity_level'],
+            avg_response_time=payload['avg_response_time'],
+            error_message=payload.get('error_message', ''),
+            reporting_timestamp=datetime.strptime(
+                payload['reporting_timestamp'], "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+        session.add(reading)
+        session.commit()
+        logger.info(
+            f"STORED error | trace={payload['trace_id']} code={payload['error_code']}"
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"DB error storing error event: {e}")
+        raise
+    finally:
+        session.close()
 
-class KafkaConsumerWrapper:
+
+# ── Kafka Consumer Thread ─────────────────────────────────────────────────────
+
+def _create_consumer() -> KafkaConsumer:
     """
-    Wrapper around Kafka consumer that handles connection failures gracefully.
-    
-    FIX FOR ISSUE 2: Single consumer reused instead of creating new ones
-    FIX FOR ISSUE 3: Automatic reconnection with exponential backoff
+    Keep retrying with exponential backoff until Kafka is reachable.
+    Returns a ready-to-use KafkaConsumer.
     """
-    
-    def __init__(self, kafka_server, topic, max_retries=10):
-        """
-        Initialize the consumer wrapper.
-        
-        Args:
-            kafka_server: Kafka server address (hostname:port)
-            topic: Kafka topic to subscribe to
-            max_retries: Maximum connection attempts before giving up
-        """
-        self.kafka_server = kafka_server
-        self.topic = topic
-        self.max_retries = max_retries
-        self.consumer = None
-        self.is_connected = False
-        self._connect()
-    
-    def _connect(self):
-        """
-        Connect to Kafka with retry logic and exponential backoff.
-        
-        Strategy: Infinite retry with backoff because:
-        - Kafka is essential for this service to function
-        - Exponential backoff prevents hammering Kafka
-        - Service will work once Kafka is available
-        """
-        attempt = 1
-        
-        while True:
-            try:
-                logger.info(f"[Consumer] Connection attempt {attempt}/{self.max_retries} to Kafka at {self.kafka_server}")
-                
-                # Create consumer with connection settings
-                self.consumer = KafkaConsumer(
-                    self.topic,
-                    bootstrap_servers=self.kafka_server,
-                    group_id='storage_group',
-                    auto_offset_reset='earliest',
-                    enable_auto_commit=False,  # Manual commit for safety
-                    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                    session_timeout_ms=30000,  # 30 second session timeout
-                    heartbeat_interval_ms=10000  # Heartbeat every 10 seconds
-                )
-                
-                self.is_connected = True
-                logger.info(f"[Consumer] ✅ Successfully connected to Kafka at {self.kafka_server}")
-                return  # Connection successful, exit retry loop
-                
-            except (NoBrokersAvailable, KafkaError) as e:
-                logger.warning(f"[Consumer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
-                
-                if attempt >= self.max_retries:
-                    logger.error(f"[Consumer] Could not connect after {self.max_retries} attempts.")
-                    self.is_connected = False
-                    raise Exception(f"Kafka connection failed after {self.max_retries} retries")
-                
-                # Exponential backoff: 1s, 2s, 4s, 8s, etc. (capped at 32s)
-                wait_time = min(2 ** (attempt - 1), 32)
-                logger.info(f"[Consumer] Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-                attempt += 1
-    
-    def get_messages(self):
-        """
-        Generator that yields messages from Kafka.
-        If connection fails, automatically reconnects.
-        
-        Yields:
-            Tuple of (message_value, success_boolean)
-        """
-        while True:
-            if not self.is_connected or self.consumer is None:
-                try:
-                    self._connect()
-                except Exception as e:
-                    logger.error(f"[Consumer] Cannot connect: {e}")
-                    time.sleep(5)  # Wait before retrying
-                    continue
-            
-            try:
-                # Consumer is a blocking iterator - it waits for messages
-                for msg in self.consumer:
-                    try:
-                        yield msg.value, True  # Successfully got message
-                        
-                        # Commit offset only after successful processing
-                        self.consumer.commit()
-                        
-                    except Exception as process_error:
-                        logger.error(f"[Consumer] Error processing message: {process_error}")
-                        # Don't commit on error - message will be reprocessed
-                        yield None, False
-                        
-            except KafkaError as e:
-                logger.error(f"[Consumer] Kafka error in consumer loop: {e}")
-                logger.warning("[Consumer] Attempting to reconnect...")
-                self.is_connected = False
-                self.consumer = None
-                try:
-                    self._connect()
-                except Exception as reconnect_error:
-                    logger.error(f"[Consumer] Reconnection failed: {reconnect_error}")
-                time.sleep(5)  # Wait before retrying
-                
-            except Exception as e:
-                logger.error(f"[Consumer] Unexpected error in consumer loop: {e}")
-                self.is_connected = False
-                self.consumer = None
-                time.sleep(5)  # Wait before retrying
-
-
-# Lazy-initialize consumer wrapper (don't create until first use - speeds up startup!)
-consumer_wrapper = None
-
-def get_consumer_wrapper():
-    """Lazily create Kafka consumer on first use"""
-    global consumer_wrapper
-    if consumer_wrapper is None:
+    delay = 1
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            logger.info("[Consumer] Lazily initializing Kafka consumer...")
-            consumer_wrapper = KafkaConsumerWrapper(KAFKA_SERVER, KAFKA_TOPIC)
-            logger.info("✅ Global Kafka consumer created successfully")
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_SERVER,
+                group_id='storage_group',
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                session_timeout_ms=30000,
+                heartbeat_interval_ms=10000,
+                max_poll_interval_ms=300000,
+            )
+            logger.info(f"Kafka consumer connected on attempt {attempt}")
+            return consumer
+        except (NoBrokersAvailable, KafkaError) as e:
+            logger.warning(
+                f"Kafka not available (attempt {attempt}): {e}. Retrying in {delay}s …"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
         except Exception as e:
-            logger.error(f"❌ Failed to create Kafka consumer: {e}")
-            raise
-    return consumer_wrapper
+            logger.error(f"Unexpected error connecting consumer: {e}. Retrying in {delay}s …")
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
 
-
-def use_db_session(func):
-    """
-    Decorator to inject database session into functions.
-    
-    FIX FOR ISSUE 4: Session uses pooled connections with proper recycling
-    """
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        session = make_session()
-        try:
-            return func(session, *args, **kwargs)
-        finally:
-            session.close()
-    return wrapper
-
-
-@use_db_session
-def report_performance_metrics(session, body):
-    """
-    Store performance metric to database.
-    
-    FIX FOR ISSUE 4: Uses pooled database connection
-    """
-    reading = PerformanceReading(
-        trace_id=body['trace_id'],
-        server_id=body['server_id'],
-        cpu=body['cpu'],
-        memory=body['memory'],
-        disk_io=body['disk_io'],
-        reporting_timestamp=datetime.strptime(body['reporting_timestamp'], "%Y-%m-%dT%H:%M:%SZ")
-    )
-    
-    session.add(reading)
-    session.commit()
-
-    logger.info(f" STORED: Performance reading (trace_id: {body['trace_id']}, server: {body['server_id']})")
-    return NoContent, 201
-
-
-@use_db_session
-def report_error_metrics(session, body):
-    """
-    Store error metric to database.
-    
-    FIX FOR ISSUE 4: Uses pooled database connection
-    """
-    reading = ErrorReading(
-        trace_id=body['trace_id'],
-        server_id=body['server_id'],
-        error_code=body['error_code'],
-        severity_level=body['severity_level'],
-        avg_response_time=body['avg_response_time'],
-        error_message=body['error_message'],
-        reporting_timestamp=datetime.strptime(body['reporting_timestamp'], "%Y-%m-%dT%H:%M:%SZ")
-    )
-    
-    session.add(reading)
-    session.commit()
-
-    logger.info(f" STORED: Error reading (trace_id: {body['trace_id']}, server: {body['server_id']}, code: {body['error_code']})")
-    return NoContent, 201
-
-
-@use_db_session
-def get_performance_readings(session, start_timestamp, end_timestamp):
-    """
-    Retrieve performance readings within time range.
-    
-    FIX FOR ISSUE 4: Uses pooled database connection
-    """
-    logger.debug(f"GET /monitoring/performance request: {start_timestamp} to {end_timestamp}")
-    
-    start_timestamp = start_timestamp.strip()
-    end_timestamp = end_timestamp.strip()
-    
-    start_datetime = datetime.strptime(start_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    end_datetime = datetime.strptime(end_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    
-    statement = select(PerformanceReading).where(
-        PerformanceReading.date_created >= start_datetime
-    ).where(
-        PerformanceReading.date_created < end_datetime
-    )
-    
-    results = [reading.to_dict() for reading in session.execute(statement).scalars().all()]
-    
-    logger.info(f"GET request: Found {len(results)} performance readings between {start_timestamp} and {end_timestamp}")
-    
-    return results, 200
-
-
-@use_db_session
-def get_error_readings(session, start_timestamp, end_timestamp):
-    """
-    Retrieve error readings within time range.
-    
-    FIX FOR ISSUE 4: Uses pooled database connection
-    """
-    logger.debug(f"GET /monitoring/errors request: {start_timestamp} to {end_timestamp}")
-    
-    start_timestamp = start_timestamp.strip()
-    end_timestamp = end_timestamp.strip()
-    
-    start_datetime = datetime.strptime(start_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    end_datetime = datetime.strptime(end_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    
-    statement = select(ErrorReading).where(
-        ErrorReading.date_created >= start_datetime
-    ).where(
-        ErrorReading.date_created < end_datetime
-    )
-    
-    results = [reading.to_dict() for reading in session.execute(statement).scalars().all()]
-    
-    logger.info(f"GET request: Found {len(results)} error readings between {start_timestamp} and {end_timestamp}")
-    
-    return results, 200
-
-
-# ==========================================
-# KAFKA CONSUMER THREAD
-# ==========================================
-# FIX FOR ISSUE 2: Uses global consumer wrapper
-# FIX FOR ISSUE 3: Automatic reconnection handled by wrapper
-# FIX FOR ISSUE 4: Uses pooled database connections
 
 def process_messages():
     """
-    Process event messages from Kafka.
-    
-    Runs in background thread. Listens for messages and stores them in database.
-    Automatically handles Kafka reconnection via consumer wrapper.
+    Background daemon thread.
+    Consumes Kafka messages forever, reconnecting automatically on failure.
     """
-    logger.info(f" Connecting to Kafka at {KAFKA_SERVER}")
-    
-    try:
-        # Lazily get the consumer wrapper (creates it on first access)
-        wrapper = get_consumer_wrapper()
-        
-        logger.info(f" Subscribed to topic: {KAFKA_TOPIC}")
-        logger.info(" Waiting for messages...")
-        
-        # Use the consumer wrapper to get messages
-        # It handles reconnection automatically
-        for msg_data, success in wrapper.get_messages():
-            if not success:
-                continue  # Skip failed messages
-            
+    logger.info("Kafka consumer thread started")
+
+    while True:                         # outer loop: reconnect on fatal errors
+        consumer = _create_consumer()
+        try:
+            for msg in consumer:        # inner loop: process messages
+                try:
+                    data      = msg.value
+                    msg_type  = data.get('type')
+                    payload   = data.get('payload', {})
+                    trace_id  = payload.get('trace_id', 'unknown')
+
+                    logger.info(f"RECEIVED from Kafka | type={msg_type} trace={trace_id}")
+
+                    if msg_type == 'performance_metric':
+                        _store_performance(payload)
+                    elif msg_type == 'error_metric':
+                        _store_error(payload)
+                    else:
+                        logger.warning(f"Unknown message type: {msg_type}")
+
+                    consumer.commit()
+
+                except Exception as e:
+                    logger.error(f"Error processing message: {e} – skipping, not committing")
+
+        except Exception as e:
+            logger.error(f"Kafka consumer loop error: {e}. Reconnecting …")
             try:
-                payload = msg_data["payload"]
-                msg_type = msg_data["type"]
-                trace_id = payload.get('trace_id', 'unknown')
-                server_id = payload.get('server_id', 'unknown')
-                
-                logger.info(f" RECEIVED FROM KAFKA: {msg_type} (trace: {trace_id}, server: {server_id})")
-                
-                if msg_type == "performance_metric":
-                    # Store the performance metric to the DB
-                    report_performance_metrics(payload)
-                    
-                elif msg_type == "error_metric":
-                    # Store the error metric to the DB
-                    report_error_metrics(payload)
-                    
-                else:
-                    logger.warning(f"Unknown message type: {msg_type}")
-                    
-            except Exception as e:
-                logger.error(f" Error processing message: {e}")
-                # Message not committed, will be reprocessed
-                
+                consumer.close()
+            except Exception:
+                pass
+            time.sleep(2)
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+def get_performance_readings(start_timestamp, end_timestamp):
+    """GET /monitoring/performance?start_timestamp=…&end_timestamp=…"""
+    logger.debug(f"GET performance | {start_timestamp} → {end_timestamp}")
+
+    session = make_session()
+    try:
+        start_dt = datetime.strptime(start_timestamp.strip(), "%Y-%m-%dT%H:%M:%SZ")
+        end_dt   = datetime.strptime(end_timestamp.strip(),   "%Y-%m-%dT%H:%M:%SZ")
+
+        rows = session.execute(
+            select(PerformanceReading)
+            .where(PerformanceReading.date_created >= start_dt)
+            .where(PerformanceReading.date_created <  end_dt)
+        ).scalars().all()
+
+        results = [r.to_dict() for r in rows]
+        logger.info(f"GET performance: returned {len(results)} rows")
+        return results, 200
+
     except Exception as e:
-        logger.error(f" Fatal error in Kafka consumer: {e}")
+        logger.error(f"Error fetching performance readings: {e}")
+        return {"message": str(e)}, 400
+    finally:
+        session.close()
 
 
-def setup_kafka_thread():
-    """Setup and start Kafka consumer thread"""
-    t1 = threading.Thread(target=process_messages)
-    t1.daemon = True
-    t1.start()
-    logger.info(" Kafka consumer thread started")
+def get_error_readings(start_timestamp, end_timestamp):
+    """GET /monitoring/errors?start_timestamp=…&end_timestamp=…"""
+    logger.debug(f"GET errors | {start_timestamp} → {end_timestamp}")
 
+    session = make_session()
+    try:
+        start_dt = datetime.strptime(start_timestamp.strip(), "%Y-%m-%dT%H:%M:%SZ")
+        end_dt   = datetime.strptime(end_timestamp.strip(),   "%Y-%m-%dT%H:%M:%SZ")
 
-# ==========================================
-# CONNEXION APP SETUP
-# ==========================================
+        rows = session.execute(
+            select(ErrorReading)
+            .where(ErrorReading.date_created >= start_dt)
+            .where(ErrorReading.date_created <  end_dt)
+        ).scalars().all()
 
-app = connexion.FlaskApp(__name__, specification_dir='')
-app.add_api("storage_openapi.yaml",
-            strict_validation=True,
-            validate_responses=True)
+        results = [r.to_dict() for r in rows]
+        logger.info(f"GET errors: returned {len(results)} rows")
+        return results, 200
 
-flask_app = app.app
+    except Exception as e:
+        logger.error(f"Error fetching error readings: {e}")
+        return {"message": str(e)}, 400
+    finally:
+        session.close()
 
 
 def health():
-    """Health check endpoint"""
+    """GET /health – liveness probe."""
     return {"status": "healthy"}, 200
+
+
+# ── App Setup ─────────────────────────────────────────────────────────────────
+
+app = connexion.FlaskApp(__name__, specification_dir='')
+app.add_api(
+    "storage_openapi.yaml",
+    strict_validation=True,
+    validate_responses=True,
+)
+
+flask_app = app.app
+CORS(flask_app)
 
 
 @flask_app.route('/')
 def home():
-    """Home page with links to API endpoints"""
-    return '''
-    <html>
-        <head>
-            <title>Storage Service</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; }
-                h1 { color: #2c3e50; }
-                code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
-            </style>
-        </head>
-        <body>
-            <h1> Storage Service</h1>
-            <h2>Available Endpoints:</h2>
-            <ol>
-                <li>
-                    <strong>GET:</strong> 
-                    <code>/monitoring/performance?start_timestamp=2026-02-18T00:00:00Z&end_timestamp=2026-02-18T23:59:59Z</code>
-                </li>
-                <li>
-                    <strong>GET:</strong> 
-                    <code>/monitoring/errors?start_timestamp=2026-02-18T00:00:00Z&end_timestamp=2026-02-18T23:59:59Z</code>
-                </li>
-            </ol>
-            <p><em> Messages are consumed from Kafka topic: <strong>events</strong></em></p>
-            <hr>
-            <p><a href="/ui">View API Documentation (Swagger UI)</a></p>
-        </body>
-    </html>
-    '''
+    return "<h1>Storage Service</h1><p>See /monitoring/performance and /monitoring/errors</p>"
 
 
 if __name__ == "__main__":
-    logger.info(" Starting Storage Service on port 8091")
-    
-    # Initialize database with retry logic 
+    logger.info("Starting Storage Service on port 8091")
+
+    # Wait for DB and create tables
     init_db()
-    
-    # Start background Kafka consumer thread (creates consumer on first use)
-    setup_kafka_thread()
-    
-    logger.info("✅ Storage service ready. Starting API server...")
-    
-    app.run(host="0.0.0.0", port=8091)
+
+    # Start Kafka consumer in background
+    t = threading.Thread(target=process_messages, daemon=True)
+    t.start()
+
+    app.run(host='0.0.0.0', port=8091)

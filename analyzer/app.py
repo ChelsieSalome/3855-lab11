@@ -1,3 +1,12 @@
+"""
+Analyzer Service - app.py
+Reads events directly from Kafka (from the beginning) to answer analytics queries.
+Lab 11 fixes:
+  - Single persistent KafkaConsumer (created once, reused for all requests)
+  - Retry logic with exponential backoff
+  - Thread lock so concurrent requests don't corrupt the consumer state
+"""
+
 import connexion
 from connexion import FlaskApp
 from flask_cors import CORS
@@ -5,239 +14,190 @@ import json
 import logging
 import logging.config
 import yaml
-from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable, KafkaError
 import time
 import threading
+from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable, KafkaError
 
-# Load configuration
+# ── Config & Logging ──────────────────────────────────────────────────────────
+
 with open('/config/analyzer_config.yml', 'r') as f:
     CONFIG = yaml.safe_load(f)
 
-# Load logging configuration
 with open('/config/analyzer_log_config.yml', 'r') as f:
-    log_config = yaml.safe_load(f.read())
-    logging.config.dictConfig(log_config)
+    logging.config.dictConfig(yaml.safe_load(f))
 
 logger = logging.getLogger('basicLogger')
 
-# Suppress Kafka DEBUG logs
 logging.getLogger('kafka').setLevel(logging.WARNING)
 
-logger.info("Analyzer service configuration loaded")
+KAFKA_SERVER = f"{CONFIG['kafka']['hostname']}:{CONFIG['kafka']['port']}"
+KAFKA_TOPIC  = CONFIG['kafka']['topic']
+
+# ── Global Kafka Consumer ─────────────────────────────────────────────────────
+
+_consumer_lock = threading.Lock()
+_consumer: KafkaConsumer | None = None
+_consumer_initialized = False          # True after the first seek_to_beginning
 
 
-class KafkaConsumerWrapper:
+def _create_consumer() -> KafkaConsumer:
     """
-    Thread-safe wrapper around Kafka consumer.
-    Uses a lock to prevent concurrent access issues.
+    Keep retrying with exponential backoff until Kafka is reachable.
+    Returns a ready KafkaConsumer.
     """
-    
-    def __init__(self, topic, bootstrap_servers, max_retries=10):
-        self.topic = topic
-        self.bootstrap_servers = bootstrap_servers
-        self.max_retries = max_retries
-        self.consumer = None
-        self.lock = threading.RLock()  # Reentrant lock for thread safety
-        self._connect()
-    
-    def _connect(self):
-        """Connect to Kafka with retry logic and exponential backoff."""
-        attempt = 1
-        while True:
-            try:
-                logger.info(f"[Analyzer] Connection attempt {attempt}/{self.max_retries}")
-                self.consumer = KafkaConsumer(
-                    self.topic,
-                    bootstrap_servers=self.bootstrap_servers,
-                    group_id='analyzer_group',
-                    auto_offset_reset='earliest',
-                    enable_auto_commit=False,
-                    consumer_timeout_ms=1000,
-                    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                    session_timeout_ms=30000,
-                    heartbeat_interval_ms=10000
-                )
-                logger.info(f"[Analyzer] ✅ Successfully connected to Kafka")
-                return
-                
-            except (NoBrokersAvailable, KafkaError) as e:
-                logger.warning(f"[Analyzer] ❌ Failed to connect (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt >= self.max_retries:
-                    logger.error(f"[Analyzer] Could not connect after {self.max_retries} attempts.")
-                    raise Exception(f"Kafka connection failed after {self.max_retries} retries")
-                
-                wait_time = min(2 ** (attempt - 1), 32)
-                logger.info(f"[Analyzer] Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-                attempt += 1
-    
-    def get_all_messages(self):
-        """
-        Read all messages from Kafka starting from the beginning.
-        Thread-safe - uses lock to prevent concurrent access.
-        
-        CRITICAL: Does NOT use generators (causes "generator already executing" error).
-        Instead, reads all messages into a list under a lock.
-        """
-        with self.lock:  # Acquire lock - only one request can do this at a time
-            if self.consumer is None:
-                try:
-                    self._connect()
-                except Exception as e:
-                    logger.error(f"[Analyzer] Cannot connect: {e}")
-                    return []
-            
-            try:
-                # CRITICAL FIX: Poll FIRST to trigger partition assignment
-                logger.debug("[Analyzer] Polling to trigger partition assignment...")
-                self.consumer.poll(timeout_ms=100)
-                
-                # NOW seek to beginning - partitions are assigned
-                logger.debug("[Analyzer] Seeking to beginning...")
-                self.consumer.seek_to_beginning()
-                
-                # Read ALL messages into a list (not a generator)
-                # This prevents "generator already executing" errors
-                messages = []
-                for msg in self.consumer:
-                    if msg is None:
-                        break
-                    messages.append(msg.value)
-                
-                logger.debug(f"[Analyzer] Read {len(messages)} messages from Kafka")
-                return messages
-                    
-            except KafkaError as e:
-                logger.error(f"[Analyzer] Kafka error: {e}")
-                logger.warning("[Analyzer] Attempting to reconnect...")
-                self.consumer = None
-                try:
-                    self._connect()
-                except Exception as reconnect_error:
-                    logger.error(f"[Analyzer] Reconnection failed: {reconnect_error}")
-                return []
+    delay = 1
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_SERVER,
+                group_id='analyzer_group',
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,
+                consumer_timeout_ms=1000,   # stop iteration when no more messages
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+            )
+            logger.info(f"Kafka consumer connected on attempt {attempt}")
+            return consumer
+        except (NoBrokersAvailable, KafkaError) as e:
+            logger.warning(
+                f"Kafka not available (attempt {attempt}): {e}. Retrying in {delay}s …"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
+        except Exception as e:
+            logger.error(f"Unexpected error creating consumer: {e}. Retrying in {delay}s …")
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
 
 
-# Create global consumer at module startup
-kafka_server = f"{CONFIG['kafka']['hostname']}:{CONFIG['kafka']['port']}"
-kafka_topic = CONFIG['kafka']['topic']
+def _get_consumer() -> KafkaConsumer:
+    """Return the global consumer, creating it if needed."""
+    global _consumer, _consumer_initialized
+    if _consumer is None:
+        _consumer = _create_consumer()
+        # First-time init: do a dummy poll so partition assignment happens,
+        # then seek to the very beginning so we can count from offset 0.
+        _consumer.poll(timeout_ms=1000)
+        _consumer.seek_to_beginning()
+        _consumer_initialized = True
+    return _consumer
 
-try:
-    kafka_consumer = KafkaConsumerWrapper(kafka_topic, kafka_server)
-    logger.info("✅ Global Kafka consumer created successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to create global Kafka consumer: {e}")
-    kafka_consumer = None
+
+def _read_all_messages() -> list[dict]:
+    """
+    Seek to beginning and drain all current messages.
+    Must be called with _consumer_lock held.
+    Returns a list of raw message value dicts.
+    """
+    global _consumer, _consumer_initialized
+    consumer = _get_consumer()
+
+    try:
+        consumer.seek_to_beginning()
+    except Exception as e:
+        logger.error(f"seek_to_beginning failed: {e}. Recreating consumer …")
+        try:
+            consumer.close()
+        except Exception:
+            pass
+        _consumer = None
+        _consumer_initialized = False
+        consumer = _get_consumer()
+        consumer.seek_to_beginning()
+
+    messages = []
+    for msg in consumer:            # stops when consumer_timeout_ms is hit
+        messages.append(msg.value)
+    return messages
 
 
-def get_performance_event(index):
-    """Gets a performance event at a specific index."""
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+def get_performance_event(index: int):
+    """GET /analyzer/performance?index=N"""
     logger.info(f"Request for performance event at index {index}")
-    
-    if kafka_consumer is None:
-        logger.error("Kafka consumer not available")
-        return {"message": "Service unavailable"}, 503
-    
-    try:
-        # Get all messages (thread-safe, no generators)
-        all_messages = kafka_consumer.get_all_messages()
-        
-        performance_count = 0
-        for msg_data in all_messages:
-            if msg_data.get('type') == 'performance_metric':
-                if performance_count == index:
-                    logger.info(f"Found performance event at index {index}")
-                    return msg_data['payload'], 200
-                performance_count += 1
-        
-        logger.error(f"No performance event found at index {index}")
+
+    with _consumer_lock:
+        try:
+            messages = _read_all_messages()
+        except Exception as e:
+            logger.error(f"Error reading Kafka: {e}")
+            return {"message": f"Error reading Kafka: {e}"}, 400
+
+    perf_events = [m['payload'] for m in messages if m.get('type') == 'performance_metric']
+
+    if index >= len(perf_events):
+        logger.error(f"No performance event at index {index} (total={len(perf_events)})")
         return {"message": f"No performance event at index {index}"}, 404
-        
-    except Exception as e:
-        logger.error(f"Error retrieving performance event: {str(e)}")
-        return {"message": f"Error retrieving event: {str(e)}"}, 400
+
+    logger.info(f"Returning performance event at index {index}")
+    return perf_events[index], 200
 
 
-def get_error_event(index):
-    """Gets an error event at a specific index."""
+def get_error_event(index: int):
+    """GET /analyzer/error?index=N"""
     logger.info(f"Request for error event at index {index}")
-    
-    if kafka_consumer is None:
-        logger.error("Kafka consumer not available")
-        return {"message": "Service unavailable"}, 503
-    
-    try:
-        # Get all messages (thread-safe, no generators)
-        all_messages = kafka_consumer.get_all_messages()
-        
-        error_count = 0
-        for msg_data in all_messages:
-            if msg_data.get('type') == 'error_metric':
-                if error_count == index:
-                    logger.info(f"Found error event at index {index}")
-                    return msg_data['payload'], 200
-                error_count += 1
-        
-        logger.error(f"No error event found at index {index}")
+
+    with _consumer_lock:
+        try:
+            messages = _read_all_messages()
+        except Exception as e:
+            logger.error(f"Error reading Kafka: {e}")
+            return {"message": f"Error reading Kafka: {e}"}, 400
+
+    error_events = [m['payload'] for m in messages if m.get('type') == 'error_metric']
+
+    if index >= len(error_events):
+        logger.error(f"No error event at index {index} (total={len(error_events)})")
         return {"message": f"No error event at index {index}"}, 404
-        
-    except Exception as e:
-        logger.error(f"Error retrieving error event: {str(e)}")
-        return {"message": f"Error retrieving event: {str(e)}"}, 400
+
+    logger.info(f"Returning error event at index {index}")
+    return error_events[index], 200
 
 
 def get_stats():
-    """Gets statistics about events in the Kafka queue."""
+    """GET /analyzer/stats"""
     logger.info("Request for event statistics")
-    
-    if kafka_consumer is None:
-        logger.error("Kafka consumer not available")
-        return {"message": "Service unavailable"}, 503
-    
-    try:
-        # Get all messages (thread-safe, no generators)
-        all_messages = kafka_consumer.get_all_messages()
-        
-        performance_count = 0
-        error_count = 0
-        
-        for msg_data in all_messages:
-            if msg_data.get('type') == 'performance_metric':
-                performance_count += 1
-            elif msg_data.get('type') == 'error_metric':
-                error_count += 1
-        
-        stats = {
-            "num_performance_events": performance_count,
-            "num_error_events": error_count
-        }
-        
-        logger.info(f"Statistics: {stats}")
-        return stats, 200
-        
-    except Exception as e:
-        logger.error(f"Error retrieving statistics: {str(e)}")
-        return {"message": f"Error retrieving statistics: {str(e)}"}, 400
+
+    with _consumer_lock:
+        try:
+            messages = _read_all_messages()
+        except Exception as e:
+            logger.error(f"Error reading Kafka: {e}")
+            return {"message": f"Error reading Kafka: {e}"}, 400
+
+    perf_count  = sum(1 for m in messages if m.get('type') == 'performance_metric')
+    error_count = sum(1 for m in messages if m.get('type') == 'error_metric')
+
+    stats = {
+        "num_performance_events": perf_count,
+        "num_error_events":       error_count,
+    }
+    logger.info(f"Stats: {stats}")
+    return stats, 200
 
 
 def health():
-    """Health check endpoint"""
+    """GET /analyzer/health – liveness probe."""
     return {"status": "healthy"}, 200
 
 
+# ── App Setup ─────────────────────────────────────────────────────────────────
+
 app = FlaskApp(__name__, specification_dir='')
 CORS(app.app)
+
 app.add_api(
     'openapi.yaml',
     base_path='/analyzer',
     strict_validation=True,
-    validate_responses=True
+    validate_responses=True,
 )
 
 if __name__ == '__main__':
     logger.info("Starting Analyzer Service on port 5005")
-    app.run(
-        host='0.0.0.0',
-        port=CONFIG['app']['port']
-    )
+    app.run(host='0.0.0.0', port=CONFIG['app']['port'])
