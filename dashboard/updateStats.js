@@ -1,16 +1,12 @@
 const VM_IP = "172.169.248.121"
 
+const HEALTH_CHECK_API_URL = `http://${VM_IP}:8120/health`
 const PROCESSING_STATS_API_URL = `http://${VM_IP}:8100/stats`
 const ANALYZER_API_URL = {
     stats: `http://${VM_IP}:5005/analyzer/stats`,
     performance: `http://${VM_IP}:5005/analyzer/performance?index=0`,
-    error: `http://${VM_IP}:5005/analyzer/error?index=0`,
-    health: `http://${VM_IP}:5005/analyzer/health`
+    error: `http://${VM_IP}:5005/analyzer/error?index=0`
 }
-
-const PROCESSING_HEALTH_URL = `http://${VM_IP}:8100/health`
-const RECEIVER_HEALTH_URL = `http://${VM_IP}:8080/`
-const STORAGE_HEALTH_URL = `http://${VM_IP}:8091/monitoring/performance?start_timestamp=2020-01-01T00:00:00Z&end_timestamp=2020-01-02T00:00:00Z`
 
 /**
  * Generic fetch function to retrieve data from API endpoints
@@ -36,43 +32,6 @@ const makeReq = (url, cb) => {
 };
 
 /**
- * Check service health (just needs to connect and get a response)
- * @param {string} url - Health check endpoint
- * @param {string} serviceId - ID of the service element to update
- */
-const checkHealth = (url, serviceId) => {
-    fetch(url, { method: 'GET' })
-        .then(res => {
-            if (res.ok) {
-                updateServiceStatus(serviceId, 'healthy');
-            } else {
-                updateServiceStatus(serviceId, 'unhealthy');
-            }
-        })
-        .catch(() => {
-            updateServiceStatus(serviceId, 'unhealthy');
-        });
-};
-
-/**
- * Update service status display
- * @param {string} serviceId - ID of the service
- * @param {string} status - 'healthy' or 'unhealthy'
- */
-const updateServiceStatus = (serviceId, status) => {
-    const elem = document.getElementById(serviceId);
-    if (elem) {
-        if (status === 'healthy') {
-            elem.innerHTML = `<span style="color: #4ade80;">● ${serviceId.charAt(0).toUpperCase() + serviceId.slice(1)}</span> HEALTHY`;
-            elem.className = 'service-healthy';
-        } else {
-            elem.innerHTML = `<span style="color: #f87171;">● ${serviceId.charAt(0).toUpperCase() + serviceId.slice(1)}</span> UNHEALTHY`;
-            elem.className = 'service-unhealthy';
-        }
-    }
-};
-
-/**
  * Update a code div with formatted JSON
  * @param {object} result - The data to display
  * @param {string} elemId - The element ID to update
@@ -94,11 +53,10 @@ const getStats = () => {
     console.log("🔄 Updating all statistics...");
     document.getElementById("last-updated-value").innerText = getLocaleDateStr();
     
-    // Check service health
-    checkHealth(RECEIVER_HEALTH_URL, 'receiver');
-    checkHealth(STORAGE_HEALTH_URL, 'storage');
-    checkHealth(PROCESSING_HEALTH_URL, 'processing');
-    checkHealth(ANALYZER_API_URL.health, 'analyzer');
+    // Fetch Health Check Status (all services + last update time)
+    makeReq(HEALTH_CHECK_API_URL, (result) => {
+        updateCodeDiv(result, "service-health-stats");
+    });
     
     // Fetch Processing Service Stats
     makeReq(PROCESSING_STATS_API_URL, (result) => {
