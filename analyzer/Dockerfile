@@ -1,4 +1,4 @@
-FROM python:3.11
+FROM python:3.9-slim
 
 WORKDIR /app
 
@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 5005
 
-CMD ["python", "app.py"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5005", "--workers", "4"]
