@@ -60,7 +60,7 @@ class KafkaConsumerWrapper:
                 group_id='analyzer_group',
                 auto_offset_reset='earliest',
                 enable_auto_commit=False,
-                consumer_timeout_ms=1000,
+                consumer_timeout_ms=100,
                 value_deserializer=lambda m: json.loads(m.decode('utf-8'))
             )
             return True
