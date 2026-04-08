@@ -259,6 +259,6 @@ app.add_api(
 if __name__ == '__main__':
     app.run(
         host='0.0.0.0',
-        port=CONFIG['app']['port']
+        port=CONFIG['app']['port'],
         workers=4
     )
