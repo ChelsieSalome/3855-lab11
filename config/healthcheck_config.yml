@@ -10,7 +10,7 @@ health_check:
   # HTTP request timeout: 5 seconds
   # - Reasonable for services on same network
   # - Quickly detects hung services
-  timeout_seconds: 10
+  timeout_seconds: 15
 
 # Services to monitor
 # Uses Docker service names (from docker-compose)

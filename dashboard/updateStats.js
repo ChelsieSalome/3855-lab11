@@ -202,5 +202,5 @@ const refresh = () => {
 document.addEventListener("DOMContentLoaded", () => {
     console.log("🚀 Dashboard initialized");
     refresh();
-    setInterval(refresh, 3000);
+    setInterval(refresh, 5000);
 });
