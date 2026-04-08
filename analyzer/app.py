@@ -1,185 +1,263 @@
-"""
-Analyzer Service - app.py
-Lab 11 fixes:
-  - Uses poll() loop (not iterator) to read Kafka — works reliably with group_id=None.
-  - Background thread caches all messages every 2s.
-  - API endpoints read from cache instantly.
-  - /health never touches Kafka.
-"""
-
 import connexion
 from connexion import FlaskApp
-from connexion.middleware import MiddlewarePosition
-from starlette.middleware.cors import CORSMiddleware
+from flask_cors import CORS
 import json
 import logging
 import logging.config
 import yaml
 import time
+import random
 import threading
-from kafka import KafkaConsumer, TopicPartition
-from kafka.errors import NoBrokersAvailable, KafkaError
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
 
-# ── Config & Logging ──────────────────────────────────────────────────────────
-
+# Load configuration
 with open('/config/analyzer_config.yml', 'r') as f:
     CONFIG = yaml.safe_load(f)
 
+# Load logging configuration
 with open('/config/analyzer_log_config.yml', 'r') as f:
-    logging.config.dictConfig(yaml.safe_load(f))
+    log_config = yaml.safe_load(f.read())
+    logging.config.dictConfig(log_config)
 
 logger = logging.getLogger('basicLogger')
-logging.getLogger('kafka').setLevel(logging.WARNING)
-
-KAFKA_SERVER = f"{CONFIG['kafka']['hostname']}:{CONFIG['kafka']['port']}"
-KAFKA_TOPIC  = CONFIG['kafka']['topic']
-
-# ── In-memory cache ───────────────────────────────────────────────────────────
-
-_cache_lock            = threading.Lock()
-_cached_messages: list = []
 
 
-def _read_all_messages() -> list:
+class KafkaConsumerWrapper:
     """
-    Create a fresh consumer, read ALL messages from the topic from offset 0,
-    return them as a list, then close the consumer.
-    Uses manual partition assignment (assign + seek) — no group coordination needed.
+    Wraps a KafkaConsumer with automatic reconnection logic.
+    If Kafka goes down after startup, the wrapper keeps retrying
+    until it reconnects - no container restart needed.
     """
-    consumer = KafkaConsumer(
-        bootstrap_servers=KAFKA_SERVER,
-        group_id=None,
-        auto_offset_reset='earliest',
-        enable_auto_commit=False,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-    )
 
-    # Manually assign partition 0 of our topic (single-partition setup)
-    tp = TopicPartition(KAFKA_TOPIC, 0)
-    consumer.assign([tp])
+    def __init__(self, topic, hostname, port):
+        self.topic = topic
+        self.bootstrap_servers = f"{hostname}:{port}"
+        self.consumer = None
+        self.connect()
 
-    # Seek to very beginning
-    consumer.seek_to_beginning(tp)
+    def connect(self):
+        """Retry loop - keeps trying until a consumer is established."""
+        while True:
+            logger.info("Attempting to connect to Kafka...")
+            if self._make_consumer():
+                logger.info("Kafka consumer connected successfully")
+                break
+            # Random sleep between 0.5s and 1.5s to avoid hammering Kafka
+            sleep_time = random.randint(500, 1500) / 1000
+            logger.warning(f"Retrying Kafka connection in {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
 
-    # Find out how many messages exist
-    end_offsets = consumer.end_offsets([tp])
-    end_offset  = end_offsets[tp]
-
-    messages = []
-
-    if end_offset == 0:
-        consumer.close()
-        return messages
-
-    # Poll until we've read everything up to end_offset
-    while True:
-        records = consumer.poll(timeout_ms=500, max_records=500)
-        for _, msgs in records.items():
-            for msg in msgs:
-                messages.append(msg.value)
-
-        # Check current position
-        current_pos = consumer.position(tp)
-        if current_pos >= end_offset:
-            break
-
-    consumer.close()
-    return messages
-
-
-def _refresh_cache():
-    """Background daemon: refreshes message cache every 2 seconds."""
-    global _cached_messages
-    logger.info("Cache refresh thread started")
-
-    while True:
+    def _make_consumer(self):
+        """
+        Attempts to create a KafkaConsumer once.
+        Returns True on success, False on failure.
+        """
         try:
-            messages = _read_all_messages()
-            with _cache_lock:
-                _cached_messages = messages
-            logger.debug(f"Cache refreshed: {len(messages)} messages")
-        except (NoBrokersAvailable, KafkaError) as e:
-            logger.warning(f"Kafka unavailable: {e}. Retrying in 5s …")
-            time.sleep(5)
-            continue
+            self.consumer = KafkaConsumer(
+                self.topic,
+                bootstrap_servers=self.bootstrap_servers,
+                group_id='analyzer_group',
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,
+                consumer_timeout_ms=1000,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+            return True
+        except KafkaError as e:
+            logger.warning(f"Kafka connection failed: {e}")
+            self.consumer = None
+            return False
         except Exception as e:
-            logger.error(f"Cache refresh error: {e}. Retrying in 5s …")
-            time.sleep(5)
-            continue
+            logger.warning(f"Unexpected error connecting to Kafka: {e}")
+            self.consumer = None
+            return False
 
-        time.sleep(2)
+    def get_consumer(self):
+        """
+        Returns the active consumer, reconnecting first if needed.
+        Call this inside every endpoint instead of using kafka_consumer directly.
+        """
+        if self.consumer is None:
+            logger.warning("Consumer is None - reconnecting...")
+            self.connect()
+        return self.consumer
+
+    def reset(self):
+        """
+        Called when a Kafka error occurs mid-operation.
+        Closes the broken consumer and triggers reconnection.
+        """
+        logger.warning("Resetting Kafka consumer after error...")
+        try:
+            if self.consumer:
+                self.consumer.close()
+        except Exception:
+            pass
+        self.consumer = None
+        self.connect()
 
 
-# Start background cache thread
-_t = threading.Thread(target=_refresh_cache, daemon=True)
-_t.start()
+# Create ONE global wrapper at startup - replaces the old create_consumer()
+kafka_wrapper = KafkaConsumerWrapper(
+    topic=CONFIG['kafka']['topic'],
+    hostname=CONFIG['kafka']['hostname'],
+    port=CONFIG['kafka']['port']
+)
+
+# Lock to prevent concurrent access to the consumer
+consumer_lock = threading.Lock()
+
+# Flag to track if consumer has been initialized (seek to beginning on first use)
+consumer_initialized = False
 
 
-def _snapshot() -> list:
-    with _cache_lock:
-        return list(_cached_messages)
-
-
-# ── API Endpoints ─────────────────────────────────────────────────────────────
-
-def get_performance_event(index: int):
-    """GET /analyzer/performance?index=N"""
+def get_performance_event(index):
+    """Gets a performance event at a specific index from the Kafka topic."""
     logger.info(f"Request for performance event at index {index}")
-    events = [m['payload'] for m in _snapshot() if m.get('type') == 'performance_metric']
-    if index >= len(events):
-        logger.error(f"No performance event at index {index} (total={len(events)})")
+
+    global consumer_initialized
+
+    try:
+        with consumer_lock:
+            consumer = kafka_wrapper.get_consumer()
+
+            # Seek to beginning on first use so we read all historical messages
+            if not consumer_initialized:
+                logger.info("Initializing consumer - seeking to beginning")
+                consumer.poll(timeout_ms=1000)
+                consumer.seek_to_beginning()
+                consumer_initialized = True
+
+            consumer.seek_to_beginning()
+            performance_count = 0
+
+            for msg in consumer:
+                data = msg.value
+                if data.get('type') == 'performance_metric':
+                    if performance_count == index:
+                        logger.info(f"Found performance event at index {index}")
+                        return data['payload'], 200
+                    performance_count += 1
+
+        logger.error(f"No performance event found at index {index}")
         return {"message": f"No performance event at index {index}"}, 404
-    logger.info(f"Returning performance event at index {index}")
-    return events[index], 200
+
+    except KafkaError as e:
+        # Kafka dropped mid-read - reset and let next request reconnect
+        logger.error(f"Kafka error retrieving performance event: {e}")
+        kafka_wrapper.reset()
+        return {"message": "Kafka unavailable, reconnecting - please retry"}, 503
+
+    except Exception as e:
+        logger.error(f"Error retrieving performance event: {e}")
+        return {"message": f"Error retrieving event: {str(e)}"}, 400
 
 
-def get_error_event(index: int):
-    """GET /analyzer/error?index=N"""
+def get_error_event(index):
+    """Gets an error event at a specific index from the Kafka topic."""
     logger.info(f"Request for error event at index {index}")
-    events = [m['payload'] for m in _snapshot() if m.get('type') == 'error_metric']
-    if index >= len(events):
-        logger.error(f"No error event at index {index} (total={len(events)})")
+
+    global consumer_initialized
+
+    try:
+        with consumer_lock:
+            consumer = kafka_wrapper.get_consumer()
+
+            if not consumer_initialized:
+                logger.info("Initializing consumer - seeking to beginning")
+                consumer.poll(timeout_ms=1000)
+                consumer.seek_to_beginning()
+                consumer_initialized = True
+
+            consumer.seek_to_beginning()
+            error_count = 0
+
+            for msg in consumer:
+                data = msg.value
+                if data.get('type') == 'error_metric':
+                    if error_count == index:
+                        logger.info(f"Found error event at index {index}")
+                        return data['payload'], 200
+                    error_count += 1
+
+        logger.error(f"No error event found at index {index}")
         return {"message": f"No error event at index {index}"}, 404
-    logger.info(f"Returning error event at index {index}")
-    return events[index], 200
+
+    except KafkaError as e:
+        logger.error(f"Kafka error retrieving error event: {e}")
+        kafka_wrapper.reset()
+        return {"message": "Kafka unavailable, reconnecting - please retry"}, 503
+
+    except Exception as e:
+        logger.error(f"Error retrieving error event: {e}")
+        return {"message": f"Error retrieving event: {str(e)}"}, 400
 
 
 def get_stats():
-    """GET /analyzer/stats"""
+    """Gets statistics about events in the Kafka topic."""
     logger.info("Request for event statistics")
-    msgs        = _snapshot()
-    perf_count  = sum(1 for m in msgs if m.get('type') == 'performance_metric')
-    error_count = sum(1 for m in msgs if m.get('type') == 'error_metric')
-    stats = {"num_performance_events": perf_count, "num_error_events": error_count}
-    logger.info(f"Stats: {stats}")
-    return stats, 200
+
+    global consumer_initialized
+
+    try:
+        with consumer_lock:
+            consumer = kafka_wrapper.get_consumer()
+
+            if not consumer_initialized:
+                logger.info("Initializing consumer - seeking to beginning")
+                consumer.poll(timeout_ms=1000)
+                consumer.seek_to_beginning()
+                consumer_initialized = True
+
+            consumer.seek_to_beginning()
+            performance_count = 0
+            error_count = 0
+
+            for msg in consumer:
+                data = msg.value
+                if data.get('type') == 'performance_metric':
+                    performance_count += 1
+                elif data.get('type') == 'error_metric':
+                    error_count += 1
+
+        stats = {
+            "num_performance_events": performance_count,
+            "num_error_events": error_count
+        }
+        logger.info(f"Statistics: {stats}")
+        return stats, 200
+
+    except KafkaError as e:
+        logger.error(f"Kafka error retrieving statistics: {e}")
+        kafka_wrapper.reset()
+        return {"message": "Kafka unavailable, reconnecting - please retry"}, 503
+
+    except Exception as e:
+        logger.error(f"Error retrieving statistics: {e}")
+        return {"message": f"Error retrieving statistics: {str(e)}"}, 400
 
 
 def health():
-    """GET /analyzer/health — always instant."""
+    """Health check endpoint - always returns 200 if the service is running."""
     return {"status": "healthy"}, 200
 
 
-# ── App Setup ─────────────────────────────────────────────────────────────────
-
 app = FlaskApp(__name__, specification_dir='')
 
-app.add_middleware(
-    CORSMiddleware,
-    position=MiddlewarePosition.BEFORE_EXCEPTION,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Enable CORS
+CORS(app.app)
 
+# Add API with base path
 app.add_api(
     'openapi.yaml',
     base_path='/analyzer',
     strict_validation=True,
-    validate_responses=True,
+    validate_responses=True
 )
 
 if __name__ == '__main__':
-    logger.info("Starting Analyzer Service on port 5005")
-    app.run(host='0.0.0.0', port=CONFIG['app']['port'])
+    app.run(
+        host='0.0.0.0',
+        port=CONFIG['app']['port']
+    )

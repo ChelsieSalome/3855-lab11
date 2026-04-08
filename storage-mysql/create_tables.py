@@ -26,7 +26,6 @@ with open('/config/storage_log_config.yml', 'r') as f:
 
 logger = logging.getLogger('basicLogger')
 
-# ── Engine (with connection pool settings) ────────────────────────────────────
 
 DATABASE_URL = (
     f"mysql+pymysql://{db_conf['user']}:{db_conf['password']}"
@@ -36,7 +35,7 @@ DATABASE_URL = (
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    # ── Pool settings (Lab 11 fix) ──────────────────────────────────────────
+    #  Pool settings (Lab 11 fix) 
     pool_size=10,           # keep 10 connections open and ready
     max_overflow=20,        # allow up to 10+20=30 under burst load
     pool_recycle=3600,      # recycle connections after 1 h (before MySQL's 8-h timeout)
@@ -49,7 +48,6 @@ logger.info(
     f"db={db_conf['db']}"
 )
 
-# ── Session factory ───────────────────────────────────────────────────────────
 
 _SessionFactory = sessionmaker(bind=engine)
 
@@ -59,7 +57,7 @@ def make_session():
     return _SessionFactory()
 
 
-# ── Table creation with retry ─────────────────────────────────────────────────
+# Table creation with retry 
 
 def init_db(retries: int = 15, delay: int = 5):
     """
