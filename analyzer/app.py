@@ -57,7 +57,7 @@ class KafkaConsumerWrapper:
             self.consumer = KafkaConsumer(
                 self.topic,
                 bootstrap_servers=self.bootstrap_servers,
-                group_id='analyzer_group',
+                group_id=None,
                 auto_offset_reset='earliest',
                 enable_auto_commit=False,
                 consumer_timeout_ms=100,
